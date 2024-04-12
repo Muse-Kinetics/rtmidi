@@ -3129,6 +3129,7 @@ void MidiOutWinMM :: openVirtualPort( const std::string &/*portName*/ )
   error( RtMidiError::WARNING, errorString_ );
 }
 
+//#include <qdebug.h>
 void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 {
   if ( !connected_ ) return;
@@ -3169,16 +3170,24 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     }
 
     // Send the message.
-    result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
-    if ( result != MMSYSERR_NOERROR ) {
-      free( buffer );
-      errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message.";
-      error( RtMidiError::DRIVER_ERROR, errorString_ );
-      return;
+    if (connected_)
+    {
+        static int packetsSent = 0;
+//        qDebug() << "RTMIDI: Sending windows syx packet: " << ++packetsSent << " size: " << nBytes << "...";
+        result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
+//        qDebug() << "RTMIDI: midiOutLongMsg done";
+        if ( result != MMSYSERR_NOERROR ) {
+          free( buffer );
+          errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message.";
+          error( RtMidiError::DRIVER_ERROR, errorString_ );
+          return;
+        }
     }
 
     // Unprepare the buffer and MIDIHDR.
+//    qDebug() << "RTMIDI: midiOutUnprepareHeader start";
     while ( MIDIERR_STILLPLAYING == midiOutUnprepareHeader( data->outHandle, &sysex, sizeof ( MIDIHDR ) ) ) Sleep( 1 );
+//    qDebug() << "RTMIDI: midiOutUnprepareHeader done";
     free( buffer );
   }
   else { // Channel or system message.
