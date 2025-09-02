@@ -3203,7 +3203,7 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     // Send the message immediately.
     result = midiOutShortMsg( data->outHandle, packet );
     if ( result != MMSYSERR_NOERROR ) {
-      errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message.";
+      errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message. Error code: " + std::to_string(result);
       error( RtMidiError::DRIVER_ERROR, errorString_ );
     }
   }
