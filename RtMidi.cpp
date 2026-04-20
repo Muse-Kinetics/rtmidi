@@ -3184,6 +3184,7 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
         result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
 //        qDebug() << "RTMIDI: midiOutLongMsg done";
         if ( result != MMSYSERR_NOERROR ) {
+          midiOutUnprepareHeader( data->outHandle, &sysex, sizeof( MIDIHDR ) );
           free( buffer );
           errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message.";
           error( RtMidiError::DRIVER_ERROR, errorString_ );
@@ -3262,7 +3263,19 @@ class UWPMidiInit
 public:
     UWPMidiInit()
     {
-        winrt::init_apartment();
+    // The host process may have already initialized COM with a different threading model.
+    // Ignore RPC_E_CHANGED_MODE so UWP MIDI init can proceed in mixed environments.
+    try
+    {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    }
+    catch (winrt::hresult_error const& ex)
+    {
+      if (ex.code() != RPC_E_CHANGED_MODE)
+      {
+        throw;
+      }
+    }
     }
 };
 
