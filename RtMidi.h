@@ -77,6 +77,7 @@
                         "." RTMIDI_TOSTRING(RTMIDI_VERSION_PATCH)
 #endif
 
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -108,9 +109,10 @@ class RTMIDI_DLL_PUBLIC RtMidiError : public std::exception
     MEMORY_ERROR,      /*!< An error occurred during memory allocation. */
     INVALID_PARAMETER, /*!< An invalid parameter was specified to a function. */
     INVALID_USE,       /*!< The function was called incorrectly. */
-    DRIVER_ERROR,      /*!< A system driver error occurred. */
-    SYSTEM_ERROR,      /*!< A system error occurred. */
-    THREAD_ERROR       /*!< A thread error occurred. */
+    DRIVER_ERROR,        /*!< A system driver error occurred. */
+    SYSTEM_ERROR,        /*!< A system error occurred. */
+    THREAD_ERROR,        /*!< A thread error occurred. */
+    DRIVER_NOT_INSTALLED /*!< A required driver or runtime is not installed on this system. */
   };
 
   //! The constructor.
@@ -165,8 +167,25 @@ class RTMIDI_DLL_PUBLIC RtMidi
     WEB_MIDI_API,   /*!< W3C Web MIDI API. */
     WINDOWS_UWP,    /*!< The Microsoft Universal Windows Platform MIDI API. */
     ANDROID_AMIDI,  /*!< Native Android MIDI API. */
+    WINDOWS_MIDI_SERVICES, /*!< Windows MIDI Services (Windows 11 24H2+). */
     NUM_APIS        /*!< Number of values in this enum. */
   };
+
+  //! Result returned by checkApiAvailability().
+  struct RtMidiApiAvailability {
+    bool available = true;      /*!< True when the API runtime is ready to use. */
+    std::string message;        /*!< Human-readable reason if not available. */
+    std::string installUrl;     /*!< Installer download URL when a runtime is missing. */
+  };
+
+  //! Query whether the runtime required by a compiled API is installed.
+  /*!
+    Call this before constructing any RtMidiIn / RtMidiOut objects that use the
+    specified API.  When available is false the installUrl field contains the
+    URL the user must visit to install the missing runtime (e.g. the Windows
+    MIDI Services SDK).  The check is lightweight and does not open any ports.
+  */
+  static RtMidiApiAvailability checkApiAvailability( RtMidi::Api api );
 
   //! A static function to determine the current RtMidi version.
   static std::string getVersion( void ) throw();
@@ -634,6 +653,240 @@ class RTMIDI_DLL_PUBLIC MidiInApi : public MidiApi
 
  protected:
   RtMidiInData inputData_;
+};
+
+// ---------------------------------------------------------------------------
+//! \class Midi1UmpEncoder
+//! \brief Stateful MIDI 1.0 byte-stream to UMP word encoder.
+//!
+//! Converts raw MIDI 1.0 bytes into a flat std::vector<uint32_t> of UMP words
+//! suitable for SendMultipleMessagesWordArray (Windows MIDI Services) or any
+//! other UMP-capable send API.  State persists across calls so chunked SysEx
+//! (F0 in one buffer, F7 in a later one), running status, and mixed buffers
+//! (channel messages followed by SysEx start) all work correctly without any
+//! application-level coordination.
+//!
+//! Supported:
+//!   - Channel voice (0x80-0xEF)   Type-2 32-bit UMP words
+//!   - Running status
+//!   - System Common (0xF1-0xF6)   Type-1 32-bit UMP words
+//!   - System Realtime (0xF8-0xFF) Type-1, emitted immediately without
+//!     interrupting SysEx accumulation or running status
+//!   - SysEx (0xF0...0xF7), including multi-buffer chunked sends
+//!     Type-3 64-bit UMP word pairs, flushed at each 0xF7
+// ---------------------------------------------------------------------------
+class RTMIDI_DLL_PUBLIC Midi1UmpEncoder
+{
+public:
+    Midi1UmpEncoder() = default;
+
+    //! Encode bytes from buf[0..len-1], appending UMP words to |out|.
+    //! |group| is the UMP group index (0-15).
+    void encode(const uint8_t* buf, size_t len, uint8_t group,
+                std::vector<uint32_t>& out)
+    {
+        for (size_t i = 0; i < len; ++i)
+        {
+            const uint8_t b = buf[i];
+
+            // System Realtime (0xF8-0xFF): single-byte, emit immediately.
+            // Does NOT cancel running status or interrupt SysEx accumulation.
+            if (b >= 0xF8)
+            {
+                emit_type1(b, 0, 0, group, out);
+                continue;
+            }
+
+            // Status byte (0x80-0xF7)
+            if (b >= 0x80)
+            {
+                if (b == 0xF0) // SYX_START
+                {
+                    // SysEx start: discard any partial channel message.
+                    data_count_      = 0;
+                    running_status_  = 0;
+                    in_sysex_        = true;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                }
+                else if (b == 0xF7) // SYX_END
+                {
+                    // SysEx end: emit end/complete with whatever bytes remain
+                    // (0-6). A 0-byte "end" is valid UMP and maps to just F7
+                    // on the wire for MIDI 1.0 devices.
+                    if (in_sysex_)
+                    {
+                        const uint8_t sn = sysex_started_ ? 0x3u : 0x0u;
+                        emit_sysex_packet(sn, sysex_buf_count_, group, out);
+                    }
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    running_status_  = 0;
+                    data_count_      = 0;
+                }
+                else if (b == 0xF4 || b == 0xF5)
+                {
+                    // Undefined System Common: ignore, no state change.
+                }
+                else if (b >= 0xF1 && b <= 0xF6)
+                {
+                    // System Common: cancels running status and SysEx.
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    data_count_      = 0;
+                    const int dlen  = sys_common_data_len(b);
+                    if (dlen == 0)
+                    {
+                        emit_type1(b, 0, 0, group, out);
+                        running_status_ = 0;
+                    }
+                    else
+                    {
+                        running_status_ = b;
+                        data_needed_    = dlen;
+                    }
+                }
+                else
+                {
+                    // Channel status (0x80-0xEF): set/update running status.
+                    // Cancels in-progress SysEx per MIDI spec.
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    running_status_  = b;
+                    data_needed_     = channel_data_len(b);
+                    data_count_      = 0;
+                }
+                continue;
+            }
+
+            // Data byte (0x00-0x7F)
+            if (in_sysex_)
+            {
+                // Flush a full 6-byte group immediately as start or continue.
+                if (sysex_buf_count_ == 6)
+                {
+                    emit_sysex_packet(sysex_started_ ? 0x2u : 0x1u, 6, group, out);
+                    sysex_started_   = true;
+                    sysex_buf_count_ = 0;
+                }
+                sysex_buf_[sysex_buf_count_++] = b;
+                continue;
+            }
+
+            if (running_status_ == 0)
+                continue;  // stray data byte - ignore
+
+            data_buf_[data_count_++] = b;
+            if (data_count_ >= data_needed_)
+            {
+                const uint8_t d1 = data_buf_[0];
+                const uint8_t d2 = (data_needed_ >= 2) ? data_buf_[1] : 0;
+                if (running_status_ < 0xF0)
+                    emit_type2(running_status_, d1, d2, group, out);
+                else
+                    emit_type1(running_status_, d1, d2, group, out);
+                data_count_ = 0;
+                // System common does not support running status.
+                if (running_status_ >= 0xF0)
+                    running_status_ = 0;
+            }
+        } // end byte loop
+
+        // Flush any pending partial SysEx bytes so that each send_buffer call
+        // produces output proportional to its input rather than accumulating
+        // silently until F7 arrives in a later chunk.
+        if (in_sysex_ && sysex_buf_count_ > 0)
+        {
+            emit_sysex_packet(sysex_started_ ? 0x2u : 0x1u,
+                              sysex_buf_count_, group, out);
+            sysex_started_   = true;
+            sysex_buf_count_ = 0;
+        }
+    }
+
+    //! Discard all accumulated state (call on port close / error recovery).
+    void reset()
+    {
+        in_sysex_        = false;
+        sysex_started_   = false;
+        sysex_buf_count_ = 0;
+        running_status_  = 0;
+        data_needed_     = 0;
+        data_count_      = 0;
+    }
+
+private:
+    static int channel_data_len(uint8_t status) noexcept
+    {
+        const uint8_t type = status >> 4;
+        return (type == 0xC || type == 0xD) ? 1 : 2;
+    }
+
+    static int sys_common_data_len(uint8_t status) noexcept
+    {
+        switch (status)
+        {
+        case 0xF1: return 1;  // MTC Quarter Frame
+        case 0xF2: return 2;  // Song Position Pointer
+        case 0xF3: return 1;  // Song Select
+        default:   return 0;  // 0xF4, 0xF5 (undefined), 0xF6 (Tune Request)
+        }
+    }
+
+    // Type-2: MIDI 1.0 Channel Voice (32-bit UMP)
+    static void emit_type2(uint8_t status, uint8_t d1, uint8_t d2,
+                            uint8_t group, std::vector<uint32_t>& out)
+    {
+        out.push_back((0x2u << 28)
+                    | (static_cast<uint32_t>(group)  << 24)
+                    | (static_cast<uint32_t>(status) << 16)
+                    | (static_cast<uint32_t>(d1)     <<  8)
+                    |  static_cast<uint32_t>(d2));
+    }
+
+    // Type-1: System Common / Realtime (32-bit UMP)
+    static void emit_type1(uint8_t status, uint8_t d1, uint8_t d2,
+                            uint8_t group, std::vector<uint32_t>& out)
+    {
+        out.push_back((0x1u << 28)
+                    | (static_cast<uint32_t>(group)  << 24)
+                    | (static_cast<uint32_t>(status) << 16)
+                    | (static_cast<uint32_t>(d1)     <<  8)
+                    |  static_cast<uint32_t>(d2));
+    }
+
+    // Type-3: SysEx Data (64-bit UMP pair).
+    // sn: 0x0=complete  0x1=start  0x2=continue  0x3=end
+    // count: number of valid payload bytes (0-6), read from sysex_buf_.
+    void emit_sysex_packet(uint8_t sn, int count, uint8_t group,
+                           std::vector<uint32_t>& out)
+    {
+        uint8_t b[6] = {};
+        for (int j = 0; j < count; ++j)
+            b[j] = sysex_buf_[j];
+        out.push_back((0x3u << 28)
+                    | (static_cast<uint32_t>(group) << 24)
+                    | (static_cast<uint32_t>(sn)    << 20)
+                    | (static_cast<uint32_t>(count) << 16)
+                    | (static_cast<uint32_t>(b[0])  <<  8)
+                    |  static_cast<uint32_t>(b[1]));
+        out.push_back((static_cast<uint32_t>(b[2]) << 24)
+                    | (static_cast<uint32_t>(b[3]) << 16)
+                    | (static_cast<uint32_t>(b[4]) <<  8)
+                    |  static_cast<uint32_t>(b[5]));
+    }
+
+    bool    in_sysex_        = false;
+    bool    sysex_started_   = false;  // emitted at least one start/continue packet
+    uint8_t sysex_buf_[6]    = {};     // pending SysEx bytes not yet emitted
+    int     sysex_buf_count_ = 0;      // 0-6
+    uint8_t running_status_  = 0;
+    int     data_needed_     = 0;
+    int     data_count_      = 0;
+    uint8_t data_buf_[2]     = {};
 };
 
 class RTMIDI_DLL_PUBLIC MidiOutApi : public MidiApi
