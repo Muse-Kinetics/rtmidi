@@ -4213,6 +4213,10 @@ private:
     // Active UMP group for the open port (set by in_open/out_open)
     uint8_t active_group_{ 0 };
 
+    // Max UMP words per SendMultipleMessages* call — queried from the SDK
+    // after Open() via GetSupportedMaxMidiWordsPerTransmission().
+    uint32_t max_words_per_call_{ 684u };
+
     // Stateful MIDI 1.0 → UMP encoder (persists running status and SysEx
     // accumulation across send_buffer calls).
     Midi1UmpEncoder encoder_;
@@ -4418,6 +4422,8 @@ bool WinMidiServicesClass::out_open(size_t port_number)
         if (!connection_.Open())
             return false;
 
+        max_words_per_call_ = connection_.GetSupportedMaxMidiWordsPerTransmission();
+
 #ifdef RTMIDI_USE_WMS_COM_RAW
         // QI the COM extension interface for zero-allocation sends
         raw_ = connection_.as<IMidiEndpointConnectionRaw>();
@@ -4610,8 +4616,8 @@ bool WinMidiServicesClass::send_buffer(const unsigned char* buf, size_t len)
 
         if (words.empty()) return true;
 
-        // Both paths share the same 684-word-per-call batch limit.
-        constexpr uint32_t MAX_WORDS_PER_CALL = 684u;  // 2736 bytes / 4
+        // Both paths share the same per-call batch limit, queried from the SDK.
+        const uint32_t MAX_WORDS_PER_CALL = max_words_per_call_;
 
         const uint32_t total = static_cast<uint32_t>(words.size());
         uint32_t offset = 0;
