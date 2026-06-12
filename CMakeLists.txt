@@ -41,6 +41,7 @@ set(RTMIDI_TARGETNAME_UNINSTALL "rt_uninstall" CACHE STRING "Name of 'uninstall'
 # API Options
 option(RTMIDI_API_JACK "Compile with JACK support." ${HAVE_JACK})
 option(RTMIDI_API_WINMM "Compile with WINMM support." ${WIN32})
+option(RTMIDI_API_WMS "Compile with Windows MIDI Services support (requires vcpkg packages cppwinrt and microsoft-windows-devices-midi2)." OFF)
 option(RTMIDI_API_CORE "Compile with CoreMIDI support." ${APPLE})
 option(RTMIDI_API_ALSA "Compile with ALSA support." ${ALSA})
 option(RTMIDI_API_AMIDI "Compile with Android support." ${ANDROID})
@@ -140,6 +141,38 @@ if(RTMIDI_API_WINMM)
   list(APPEND API_DEFS "-D__WINDOWS_MM__")
   list(APPEND API_LIST "winmm")
   list(APPEND LINKLIBS winmm)
+endif()
+
+# Windows MIDI Services
+if(RTMIDI_API_WMS)
+  if(NOT WIN32)
+    message(FATAL_ERROR "RTMIDI_API_WMS is only supported on Windows")
+  endif()
+
+  # WMS requires C++17 for C++/WinRT
+  if(CMAKE_CXX_STANDARD VERSION_LESS 17)
+    set(CMAKE_CXX_STANDARD 17)
+  endif()
+
+  # cppwinrt: generates WinRT projection headers at configure time
+  find_package(cppwinrt CONFIG REQUIRED)
+
+  # Windows MIDI Services app SDK (import lib + bootstrapper + WinRT headers)
+  find_package(microsoft-windows-devices-midi2 CONFIG REQUIRED)
+
+  list(APPEND API_DEFS "-D__WINDOWS_MIDI_SERVICES__")
+  list(APPEND API_LIST "wms")
+  list(APPEND LINKLIBS Microsoft::Windows::Devices::Midi2 OneCoreUap.lib)
+  list(APPEND PACKAGE_DEPENDENCIES "find_dependency(cppwinrt CONFIG)")
+  list(APPEND PACKAGE_DEPENDENCIES "find_dependency(microsoft-windows-devices-midi2 CONFIG)")
+
+  # Optional: use the zero-allocation COM raw send path instead of WinRT
+  option(RTMIDI_USE_WMS_COM_RAW
+    "Use IMidiEndpointConnectionRaw (COM, zero-allocation) instead of WinRT SendMultipleMessagesWordArray"
+    OFF)
+  if(RTMIDI_USE_WMS_COM_RAW)
+    list(APPEND API_DEFS "-DRTMIDI_USE_WMS_COM_RAW")
+  endif()
 endif()
 
 # CoreMIDI
