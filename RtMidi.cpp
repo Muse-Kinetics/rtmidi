@@ -4050,7 +4050,7 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 //  API: Windows MIDI Services
 //
 //  Uses the Microsoft.Windows.Devices.Midi2 SDK (Windows MIDI Services).
-//  Requires the SDK runtime installer or Windows 11 24H2+.
+//  Requires the Desktop App SDK Runtime installer or Windows 11 24H2+.
 //  https://github.com/microsoft/MIDI
 //
 //*********************************************************************//
@@ -4059,6 +4059,7 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <string_view>
 
@@ -4069,15 +4070,90 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 #include <winrt/Microsoft.Windows.Devices.Midi2.h>
 #include <winrt/Microsoft.Windows.Devices.Midi2.Messages.h>
 
-// Bootstrapper — header-only, loaded at runtime via COM so the app starts
-// even if the SDK DLL is absent.
-#include "winmidi/init/Microsoft.Windows.Devices.Midi2.Initialization.hpp"
-
-// Use namespace aliases + explicit using-declarations to avoid ambiguity between
-// winrt::Microsoft (WinRT projection) and ::Microsoft (bootstrapper header).
+// Bootstrapper shim — local COM wrapper so the backend does not depend on the
+// optional NuGet-only header. Without this initialization step, direct WinRT
+// WMS probes on this machine return 0x80040154 (Class not registered) before
+// port enumeration, so the current backend still requires bootstrap.
 namespace midi2    = winrt::Microsoft::Windows::Devices::Midi2;
 namespace midi2msg = winrt::Microsoft::Windows::Devices::Midi2::Messages;
-namespace WmsInit  = Microsoft::Windows::Devices::Midi2::Initialization;
+
+namespace WmsInit
+{
+enum class MidiAppSDKPlatform : unsigned int
+{
+  Platform_x64 = 1,
+  Platform_Arm64X = 4,
+};
+
+struct __declspec(uuid("8087b303-d551-bce2-1ead-a2500d50c580")) IMidiClientInitializer : IUnknown
+{
+  virtual HRESULT __stdcall GetInstalledWindowsMidiServicesSdkVersion(
+    MidiAppSDKPlatform* buildPlatform,
+    USHORT* versionMajor,
+    USHORT* versionMinor,
+    USHORT* versionPatch,
+    LPWSTR* buildSource,
+    LPWSTR* versionName,
+    LPWSTR* versionFullString) = 0;
+
+  virtual HRESULT __stdcall EnsureServiceAvailable() = 0;
+};
+
+struct __declspec(uuid("c3263827-c3b0-bdbd-2500-ce63a3f3f2c3")) MidiClientInitializerUuid
+{
+};
+
+class MidiDesktopAppSdkInitializer
+{
+public:
+  MidiDesktopAppSdkInitializer() = default;
+
+  ~MidiDesktopAppSdkInitializer()
+  {
+    shutdown();
+  }
+
+  MidiDesktopAppSdkInitializer(const MidiDesktopAppSdkInitializer&) = delete;
+  MidiDesktopAppSdkInitializer& operator=(const MidiDesktopAppSdkInitializer&) = delete;
+
+  bool InitializeSdkRuntime()
+  {
+    if (initializer_ != nullptr)
+      return false;
+
+    IMidiClientInitializer* initializer = nullptr;
+    const HRESULT hr = CoCreateInstance(
+      __uuidof(MidiClientInitializerUuid),
+      NULL,
+      CLSCTX_INPROC_SERVER | CLSCTX_FROM_DEFAULT_CONTEXT,
+      __uuidof(IMidiClientInitializer),
+      reinterpret_cast<void**>(&initializer));
+
+    if (FAILED(hr) || initializer == nullptr)
+      return false;
+
+    initializer_ = initializer;
+    return true;
+  }
+
+  bool EnsureServiceAvailable()
+  {
+    return initializer_ != nullptr && SUCCEEDED(initializer_->EnsureServiceAvailable());
+  }
+
+private:
+  void shutdown()
+  {
+    if (initializer_ != nullptr)
+    {
+      initializer_->Release();
+      initializer_ = nullptr;
+    }
+  }
+
+  IMidiClientInitializer* initializer_{ nullptr };
+};
+}
 
 // ---------------------------------------------------------------------------
 // COM extension interface — inline definition from the IDL.
@@ -4111,6 +4187,9 @@ using midi2::MidiGroup;
 using midi2::MidiGroupTerminalBlock;
 using midi2::MidiGroupTerminalBlockDirection;
 using midi2msg::MidiMessageConverter;
+using midi2::MidiEndpointDeviceWatcher;
+using midi2::MidiEndpointDeviceInformationAddedEventArgs;
+using midi2::MidiEndpointDeviceInformationRemovedEventArgs;
 
 // ---------------------------------------------------------------------------
 // COM / WinRT apartment initializer (one per process, static)
@@ -4172,6 +4251,7 @@ public:
 
     size_t get_num_ports() const { return ports_.size(); }
     std::string get_port_name(size_t n) const { return ports_[n].display_name; }
+    bool is_sdk_ready() const { return sdk_ready_; }
 
     bool in_open(size_t port_number);
     bool out_open(size_t port_number);
@@ -4179,23 +4259,25 @@ public:
 
     bool send_buffer(const unsigned char* buf, size_t len);
 
+    // Re-enumerate the port list. Public so getPortCount() can call it to
+    // match the live-query behaviour of the WinMM backend.
+    void enumerate_ports(bool for_input);
+
     std::mutex mtx_open_close_;
     std::mutex mtx_queue_;
 
 private:
     bool init_sdk();
     void shutdown_sdk();
-    void enumerate_ports(bool for_input);
 
     // UMP → raw MIDI 1.0 bytes: fires RtMidi callback/queue
     void midi_in_callback(IMidiMessageReceivedEventSource const&,
                           MidiMessageReceivedEventArgs const& args);
 
-    std::string wstring_to_utf8(const std::wstring_view wstr) const;
+    static std::string wstring_to_utf8(const std::wstring_view wstr);
 
     MidiApi& midi_api_;
 
-    std::shared_ptr<WmsInit::MidiDesktopAppSdkInitializer> initializer_;
     bool sdk_ready_{ false };
 
     std::vector<port> ports_;
@@ -4225,33 +4307,131 @@ private:
     uint64_t last_timestamp_{ 0 };
     bool first_message_{ true };
 
+    // SysEx 7 reassembly buffer: accumulates Start/Continue fragments
+    // until the End packet arrives, then dispatches a single complete message.
+    std::vector<uint8_t> sysex_buf_;
+
+    // ---- Watcher-based port cache (shared across all instances) -----------
+    // A single MidiEndpointDeviceWatcher fires Added/Removed callbacks on a
+    // WinRT thread-pool thread; the static caches are updated there and read
+    // by enumerate_ports() with no FindAll() OS call required.
+    static void s_parse_endpoint(MidiEndpointDeviceInformation const& ep,
+                                 std::vector<port>& in_ports,
+                                 std::vector<port>& out_ports);
+
+    static std::mutex                s_ports_mtx_;
+    static std::vector<port>         s_in_cache_;
+    static std::vector<port>         s_out_cache_;
+    static MidiEndpointDeviceWatcher s_watcher_;
+    static winrt::event_token        s_tok_added_;
+    static winrt::event_token        s_tok_removed_;
+    static winrt::event_token        s_tok_enum_done_;
+    static std::mutex                s_enum_mtx_;
+    static std::condition_variable   s_enum_cv_;
+    static bool                      s_enum_ready_;
+
+    // Bootstrapper — held for the process lifetime so the WMS runtime DLL
+    // stays loaded (and the watcher keeps firing) even while individual
+    // WinMidiServicesClass instances are deleted and recreated by KMI_Ports.
+    static std::shared_ptr<WmsInit::MidiDesktopAppSdkInitializer> s_initializer_;
+
     // COM / WinRT initializer — constructed once for the lifetime of the process
     static WinMidi2Init wm2_init_;
 };
 
 WinMidi2Init WinMidiServicesClass::wm2_init_;
 
+std::mutex                WinMidiServicesClass::s_ports_mtx_;
+std::vector<WinMidiServicesClass::port> WinMidiServicesClass::s_in_cache_;
+std::vector<WinMidiServicesClass::port> WinMidiServicesClass::s_out_cache_;
+MidiEndpointDeviceWatcher WinMidiServicesClass::s_watcher_{ nullptr };
+winrt::event_token        WinMidiServicesClass::s_tok_added_{};
+winrt::event_token        WinMidiServicesClass::s_tok_removed_{};
+winrt::event_token        WinMidiServicesClass::s_tok_enum_done_{};
+std::mutex                WinMidiServicesClass::s_enum_mtx_;
+std::condition_variable   WinMidiServicesClass::s_enum_cv_;
+bool                      WinMidiServicesClass::s_enum_ready_{ false };
+std::shared_ptr<WmsInit::MidiDesktopAppSdkInitializer> WinMidiServicesClass::s_initializer_;
+
 // ---------------------------------------------------------------------------
 bool WinMidiServicesClass::init_sdk()
 {
     if (sdk_ready_) return true;
 
-    initializer_ = std::make_shared<WmsInit::MidiDesktopAppSdkInitializer>();
-    if (!initializer_)
-        return false;
+    // Bootstrap the WMS runtime and start the shared watcher exactly once for
+    // the entire process.  s_initializer_ is never released so the WMS runtime
+    // DLL stays loaded and the watcher keeps firing across delete/recreate
+    // cycles of individual WinMidiServicesClass instances.
+    static std::once_flag watcher_once;
+    static bool init_ok = false;
+    std::call_once(watcher_once, [this]()
+    {
+        // Initialise the WMS bootstrapper and keep it alive statically.
+        s_initializer_ = std::make_shared<WmsInit::MidiDesktopAppSdkInitializer>();
+        if (!s_initializer_ || !s_initializer_->InitializeSdkRuntime()
+                            || !s_initializer_->EnsureServiceAvailable())
+        {
+            s_initializer_.reset();
+            return;   // init_ok stays false
+        }
 
-    if (!initializer_->InitializeSdkRuntime())
+        auto filter =
+            MidiEndpointDeviceInformationFilters::StandardNativeMidi1ByteFormat
+            | MidiEndpointDeviceInformationFilters::StandardNativeUniversalMidiPacketFormat
+            | MidiEndpointDeviceInformationFilters::VirtualDeviceResponder;
+
+        s_watcher_ = MidiEndpointDeviceWatcher::Create(filter);
+
+        s_tok_added_ = s_watcher_.Added(
+            [](MidiEndpointDeviceWatcher const&,
+               MidiEndpointDeviceInformationAddedEventArgs const& args)
+            {
+                std::vector<port> new_in, new_out;
+                s_parse_endpoint(args.AddedDevice(), new_in, new_out);
+                std::lock_guard<std::mutex> lk(s_ports_mtx_);
+                s_in_cache_.insert(s_in_cache_.end(), new_in.begin(), new_in.end());
+                s_out_cache_.insert(s_out_cache_.end(), new_out.begin(), new_out.end());
+            });
+
+        s_tok_removed_ = s_watcher_.Removed(
+            [](MidiEndpointDeviceWatcher const&,
+               MidiEndpointDeviceInformationRemovedEventArgs const& args)
+            {
+                std::wstring id = static_cast<std::wstring>(args.EndpointDeviceId());
+                std::lock_guard<std::mutex> lk(s_ports_mtx_);
+                auto pred = [&id](port const& p) { return p.device_id == id; };
+                s_in_cache_.erase(std::remove_if(
+                    s_in_cache_.begin(), s_in_cache_.end(), pred), s_in_cache_.end());
+                s_out_cache_.erase(std::remove_if(
+                    s_out_cache_.begin(), s_out_cache_.end(), pred), s_out_cache_.end());
+            });
+
+        s_tok_enum_done_ = s_watcher_.EnumerationCompleted(
+            [](MidiEndpointDeviceWatcher const&,
+               winrt::Windows::Foundation::IInspectable const&)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(s_enum_mtx_);
+                    s_enum_ready_ = true;
+                }
+                s_enum_cv_.notify_all();
+            });
+
+        s_watcher_.Start();
+
+        // Block until initial enumeration completes (max 2 s) so that the
+        // caches are populated before the first getPortCount() call returns.
+        std::unique_lock<std::mutex> lk(s_enum_mtx_);
+        s_enum_cv_.wait_for(lk, std::chrono::seconds(2),
+                            [] { return s_enum_ready_; });
+
+        init_ok = true;
+    });
+
+    if (!init_ok)
     {
         midi_api_.error(RtMidiError::DRIVER_NOT_INSTALLED,
-            "WinMidiServicesClass: Windows MIDI Services SDK runtime not available. "
-            "Install the runtime from https://aka.ms/MidiServicesLatestSdkRuntimeInstaller");
-        return false;
-    }
-
-    if (!initializer_->EnsureServiceAvailable())
-    {
-        midi_api_.error(RtMidiError::WARNING,
-            "WinMidiServicesClass: Windows MIDI Services service could not be started.");
+            "WinMidiServicesClass: Windows MIDI Services SDK could not be initialised.");
         return false;
     }
 
@@ -4261,112 +4441,105 @@ bool WinMidiServicesClass::init_sdk()
 
 void WinMidiServicesClass::shutdown_sdk()
 {
-    // The initializer COM object is reference-counted; releasing our shared_ptr
-    // is sufficient when we are the only holder.
-    initializer_.reset();
+    // Only clear the instance flag — s_initializer_ is kept alive permanently
+    // so the WMS runtime and the shared watcher remain valid.
     sdk_ready_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// static
+void WinMidiServicesClass::s_parse_endpoint(
+    MidiEndpointDeviceInformation const& ep,
+    std::vector<port>& in_ports,
+    std::vector<port>& out_ports)
+{
+    std::string  ep_name   = wstring_to_utf8(static_cast<std::wstring_view>(ep.Name()));
+    std::wstring device_id = static_cast<std::wstring>(ep.EndpointDeviceId());
+
+    auto gtbs = ep.GetGroupTerminalBlocks();
+
+    if (gtbs.Size() == 0)
+    {
+        // No GTBs — single port at group 0, usable for both IN and OUT.
+        port p;
+        p.display_name = ep_name;
+        p.device_id    = device_id;
+        p.group_index  = 0;
+        in_ports.push_back(p);
+        out_ports.push_back(p);
+        return;
+    }
+
+    // Separate GTBs by direction.
+    //   BlockOutput (device→host) = RtMidi IN
+    //   BlockInput  (host→device) = RtMidi OUT
+    //   Bidirectional             = both
+    std::vector<MidiGroupTerminalBlock> in_gtbs, out_gtbs;
+    for (auto const& gtb : gtbs)
+    {
+        auto dir = gtb.Direction();
+        if (dir == MidiGroupTerminalBlockDirection::Bidirectional ||
+            dir == MidiGroupTerminalBlockDirection::BlockOutput)
+            in_gtbs.push_back(gtb);
+        if (dir == MidiGroupTerminalBlockDirection::Bidirectional ||
+            dir == MidiGroupTerminalBlockDirection::BlockInput)
+            out_gtbs.push_back(gtb);
+    }
+
+    // Sort + expand a GTB list into port entries.
+    auto expand = [&](std::vector<MidiGroupTerminalBlock>& matching, std::vector<port>& target)
+    {
+        if (matching.empty()) return;
+
+        std::sort(matching.begin(), matching.end(),
+            [](MidiGroupTerminalBlock const& a, MidiGroupTerminalBlock const& b) {
+                return a.FirstGroup().Index() < b.FirstGroup().Index();
+            });
+
+        uint8_t total_groups = 0;
+        for (auto const& gtb : matching) total_groups += gtb.GroupCount();
+
+        if (total_groups <= 1)
+        {
+            std::string gtb_name = wstring_to_utf8(
+                static_cast<std::wstring_view>(matching[0].Name()));
+            port p;
+            p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+            p.device_id    = device_id;
+            p.group_index  = matching[0].FirstGroup().Index();
+            target.push_back(std::move(p));
+        }
+        else
+        {
+            for (auto const& gtb : matching)
+            {
+                std::string gtb_name = wstring_to_utf8(
+                    static_cast<std::wstring_view>(gtb.Name()));
+                uint8_t first = gtb.FirstGroup().Index();
+                uint8_t count = gtb.GroupCount();
+                for (uint8_t g = 0; g < count; ++g)
+                {
+                    port p;
+                    p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+                    p.device_id    = device_id;
+                    p.group_index  = first + g;
+                    target.push_back(std::move(p));
+                }
+            }
+        }
+    };
+
+    expand(in_gtbs, in_ports);
+    expand(out_gtbs, out_ports);
 }
 
 // ---------------------------------------------------------------------------
 void WinMidiServicesClass::enumerate_ports(bool for_input)
 {
-    ports_.clear();
-    try
-    {
-        auto endpoints = MidiEndpointDeviceInformation::FindAll(
-            MidiEndpointDeviceInformationSortOrder::Name,
-            MidiEndpointDeviceInformationFilters::StandardNativeMidi1ByteFormat
-            | MidiEndpointDeviceInformationFilters::StandardNativeUniversalMidiPacketFormat
-            | MidiEndpointDeviceInformationFilters::VirtualDeviceResponder
-        );
-        for (auto const& ep : endpoints)
-        {
-            std::string  ep_name   = wstring_to_utf8(static_cast<std::wstring_view>(ep.Name()));
-            std::wstring device_id = static_cast<std::wstring>(ep.EndpointDeviceId());
-
-            // Group Terminal Blocks describe the individual ports (groups) on the
-            // device.  Filter by direction:
-            //   BlockOutput (device sends → host) = RtMidi In
-            //   BlockInput  (host sends → device) = RtMidi Out
-            //   Bidirectional                     = both
-            auto gtbs = ep.GetGroupTerminalBlocks();
-            std::vector<MidiGroupTerminalBlock> matching;
-            for (auto const& gtb : gtbs)
-            {
-                auto dir = gtb.Direction();
-                bool ok = (dir == MidiGroupTerminalBlockDirection::Bidirectional)
-                        || ( for_input && dir == MidiGroupTerminalBlockDirection::BlockOutput)
-                        || (!for_input && dir == MidiGroupTerminalBlockDirection::BlockInput);
-                if (ok)
-                    matching.push_back(gtb);
-            }
-
-            if (matching.empty())
-            {
-                // No GTBs (e.g. device has no USB MIDI 2.0 descriptor) —
-                // fall back to a single port at group 0.
-                port p;
-                p.display_name = ep_name;
-                p.device_id    = device_id;
-                p.group_index  = 0;
-                ports_.push_back(std::move(p));
-                continue;
-            }
-
-            // Sort by first group index for stable, predictable ordering.
-            std::sort(matching.begin(), matching.end(),
-                [](MidiGroupTerminalBlock const& a, MidiGroupTerminalBlock const& b) {
-                    return a.FirstGroup().Index() < b.FirstGroup().Index();
-                });
-
-            // Check if the device is truly multi-port.
-            uint8_t total_groups = 0;
-            for (auto const& gtb : matching)
-                total_groups += gtb.GroupCount();
-
-            if (total_groups <= 1)
-            {
-                // Single port — use GTB name if available (it's the per-port label),
-                // falling back to the endpoint name only when absent.
-                std::string gtb_name = wstring_to_utf8(
-                    static_cast<std::wstring_view>(matching[0].Name()));
-                port p;
-                p.display_name = gtb_name.empty() ? ep_name : gtb_name;
-                p.device_id    = device_id;
-                p.group_index  = matching[0].FirstGroup().Index();
-                ports_.push_back(std::move(p));
-            }
-            else
-            {
-                // Multi-port device — one entry per group across all matching GTBs.
-                for (auto const& gtb : matching)
-                {
-                    std::string gtb_name = wstring_to_utf8(
-                        static_cast<std::wstring_view>(gtb.Name()));
-                    uint8_t first = gtb.FirstGroup().Index();
-                    uint8_t count = gtb.GroupCount();
-                    for (uint8_t g = 0; g < count; ++g)
-                    {
-                        port p;
-                        // WMS GTB names are already fully qualified (e.g. "QuNexus Control Surface")
-                        // so use them directly rather than prepending the endpoint name.
-                        p.display_name = gtb_name.empty() ? ep_name : gtb_name;
-                        p.device_id   = device_id;
-                        p.group_index = first + g;
-                        ports_.push_back(std::move(p));
-                    }
-                }
-            }
-        }
-    }
-    catch (winrt::hresult_error const& ex)
-    {
-        std::ostringstream ss;
-        ss << "WinMidiServicesClass::enumerate_ports: HRESULT 0x"
-           << std::hex << static_cast<uint32_t>(ex.code()) << " "
-           << wstring_to_utf8(static_cast<std::wstring_view>(ex.message()));
-        midi_api_.error(RtMidiError::DRIVER_ERROR, ss.str());
-    }
+    // Port lists are maintained by the static MidiEndpointDeviceWatcher started
+    // in init_sdk(). Just copy the appropriate cache — no FindAll() OS call needed.
+    std::lock_guard<std::mutex> lk(s_ports_mtx_);
+    ports_ = for_input ? s_in_cache_ : s_out_cache_;
 }
 
 // ---------------------------------------------------------------------------
@@ -4468,6 +4641,7 @@ void WinMidiServicesClass::close()
     }
     catch (...) {}
     encoder_.reset();
+    sysex_buf_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -4552,19 +4726,42 @@ void WinMidiServicesClass::midi_in_callback(
         payload[4] = static_cast<uint8_t>((w1 >>  8) & 0xFF);
         payload[5] = static_cast<uint8_t>((w1 >>  0) & 0xFF);
 
-        if (status_nibble == 0x0 || status_nibble == 0x1)
+        uint8_t n = (byte_count < 6) ? byte_count : 6;
+
+        if (status_nibble == 0x0)
         {
-            // Complete (0) or Start (1): prepend F0
+            // Complete single-packet SysEx — dispatch immediately.
             message.bytes.push_back(0xF0);
-        }
-
-        for (uint8_t i = 0; i < byte_count && i < 6; ++i)
-            message.bytes.push_back(payload[i]);
-
-        if (status_nibble == 0x0 || status_nibble == 0x3)
-        {
-            // Complete (0) or End (3): append F7
+            for (uint8_t i = 0; i < n; ++i) message.bytes.push_back(payload[i]);
             message.bytes.push_back(0xF7);
+        }
+        else if (status_nibble == 0x1)
+        {
+            // Start — begin accumulation; do not dispatch yet.
+            sysex_buf_.clear();
+            sysex_buf_.push_back(0xF0);
+            for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
+            return;
+        }
+        else if (status_nibble == 0x2)
+        {
+            // Continue — append to accumulation buffer; do not dispatch yet.
+            if (sysex_buf_.empty()) return; // orphaned continue, discard
+            for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
+            return;
+        }
+        else if (status_nibble == 0x3)
+        {
+            // End — append final bytes, close with F7, then dispatch.
+            if (sysex_buf_.empty()) return; // orphaned end, discard
+            for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
+            sysex_buf_.push_back(0xF7);
+            message.bytes = std::move(sysex_buf_);
+            sysex_buf_.clear();
+        }
+        else
+        {
+            return; // unknown status nibble
         }
     }
     else
@@ -4676,7 +4873,7 @@ bool WinMidiServicesClass::send_buffer(const unsigned char* buf, size_t len)
 }
 
 // ---------------------------------------------------------------------------
-std::string WinMidiServicesClass::wstring_to_utf8(const std::wstring_view wstr) const
+std::string WinMidiServicesClass::wstring_to_utf8(const std::wstring_view wstr)
 {
     int len = WideCharToMultiByte(CP_UTF8, 0, wstr.data(),
                                   static_cast<int>(wstr.size()),
@@ -4729,6 +4926,13 @@ void MidiInWinMidi2::openPort(unsigned int portNumber, const std::string& /*port
         error(RtMidiError::WARNING, errorString_);
         return;
     }
+
+    // Refresh the port list from the live watcher cache.  This instance may have
+    // been created before the target device appeared (e.g. midi_in is recreated
+    // on Windows when a port closes, but the bootloader shows up 700ms later).
+    if (data->is_sdk_ready())
+        data->enumerate_ports(true);
+
     if (data->get_num_ports() == 0)
     {
         errorString_ = "MidiInWinMidi2::openPort: no MIDI input sources found!";
@@ -4738,7 +4942,8 @@ void MidiInWinMidi2::openPort(unsigned int portNumber, const std::string& /*port
     if (portNumber >= data->get_num_ports())
     {
         std::ostringstream ost;
-        ost << "MidiInWinMidi2::openPort: portNumber (" << portNumber << ") is invalid.";
+        ost << "MidiInWinMidi2::openPort: portNumber (" << portNumber
+            << ") is invalid (cache has " << data->get_num_ports() << " ports).";
         errorString_ = ost.str();
         error(RtMidiError::INVALID_PARAMETER, errorString_);
         return;
@@ -4783,8 +4988,13 @@ void MidiInWinMidi2::setPortName(const std::string&)
 
 unsigned int MidiInWinMidi2::getPortCount()
 {
-    return static_cast<unsigned int>(
-        static_cast<WinMidiServicesClass*>(apiData_)->get_num_ports());
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    // Re-enumerate on every call when no port is open, so hot-plug events
+    // (e.g. device rebooting into bootloader) are visible — matching the
+    // live-query behaviour of the WinMM backend.
+    if (!connected_ && data->is_sdk_ready())
+        data->enumerate_ports(true);
+    return static_cast<unsigned int>(data->get_num_ports());
 }
 
 std::string MidiInWinMidi2::getPortName(unsigned int portNumber)
@@ -4838,8 +5048,11 @@ void MidiOutWinMidi2::initialize(const std::string& /*clientName*/)
 
 unsigned int MidiOutWinMidi2::getPortCount()
 {
-    return static_cast<unsigned int>(
-        static_cast<WinMidiServicesClass*>(apiData_)->get_num_ports());
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    // Re-enumerate on every call when no port is open — matches WinMM behaviour.
+    if (!connected_ && data->is_sdk_ready())
+        data->enumerate_ports(false);
+    return static_cast<unsigned int>(data->get_num_ports());
 }
 
 std::string MidiOutWinMidi2::getPortName(unsigned int portNumber)
@@ -4867,6 +5080,11 @@ void MidiOutWinMidi2::openPort(unsigned int portNumber, const std::string& /*por
         error(RtMidiError::WARNING, errorString_);
         return;
     }
+
+    // Refresh the port list from the live watcher cache (same reason as MidiInWinMidi2).
+    if (data->is_sdk_ready())
+        data->enumerate_ports(false);
+
     if (data->get_num_ports() == 0)
     {
         errorString_ = "MidiOutWinMidi2::openPort: no MIDI output destinations found!";
@@ -4876,7 +5094,8 @@ void MidiOutWinMidi2::openPort(unsigned int portNumber, const std::string& /*por
     if (portNumber >= data->get_num_ports())
     {
         std::ostringstream ost;
-        ost << "MidiOutWinMidi2::openPort: portNumber (" << portNumber << ") is invalid.";
+        ost << "MidiOutWinMidi2::openPort: portNumber (" << portNumber
+            << ") is invalid (cache has " << data->get_num_ports() << " ports).";
         errorString_ = ost.str();
         error(RtMidiError::INVALID_PARAMETER, errorString_);
         return;
@@ -4963,12 +5182,12 @@ RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
         WmsInit::MidiDesktopAppSdkInitializer init;
         if ( !init.InitializeSdkRuntime() ) {
             result.available  = false;
-            result.message    = "Windows MIDI Services SDK runtime is not installed.";
+        result.message    = "Windows MIDI Services Desktop App SDK Runtime is not installed for this user/system.";
             result.installUrl = "https://aka.ms/MidiServicesLatestSdkRuntimeInstaller";
         }
     } catch ( ... ) {
         result.available  = false;
-        result.message    = "Windows MIDI Services SDK runtime check failed unexpectedly.";
+      result.message    = "Windows MIDI Services Desktop App SDK Runtime check failed unexpectedly.";
         result.installUrl = "https://aka.ms/MidiServicesLatestSdkRuntimeInstaller";
     }
 

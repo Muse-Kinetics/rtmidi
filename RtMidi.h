@@ -182,8 +182,9 @@ class RTMIDI_DLL_PUBLIC RtMidi
   /*!
     Call this before constructing any RtMidiIn / RtMidiOut objects that use the
     specified API.  When available is false the installUrl field contains the
-    URL the user must visit to install the missing runtime (e.g. the Windows
-    MIDI Services SDK).  The check is lightweight and does not open any ports.
+    URL the user must visit to install the missing runtime (for example the
+    Windows MIDI Services Desktop App SDK Runtime).  The check is lightweight
+    and does not open any ports.
   */
   static RtMidiApiAvailability checkApiAvailability( RtMidi::Api api );
 
