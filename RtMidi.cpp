@@ -4610,7 +4610,11 @@ bool WinMidiServicesClass::out_open(size_t port_number)
         if (!connection_.Open())
             return false;
 
-        max_words_per_call_ = connection_.GetSupportedMaxMidiWordsPerTransmission();
+        // GetSupportedMaxMidiWordsPerTransmission() exists in the SDK source but is
+        // not yet present in the vcpkg-distributed headers.  Use the known constant
+        // (MAXIMUM_LOOPED_UMP_DATASIZE / sizeof(uint32_t) == 2736 / 4 == 684) until
+        // a vcpkg release exposes the method; the member default already holds 684.
+        // max_words_per_call_ = connection_.GetSupportedMaxMidiWordsPerTransmission();
 
 #ifdef RTMIDI_USE_WMS_COM_RAW
         // QI the COM extension interface for zero-allocation sends
