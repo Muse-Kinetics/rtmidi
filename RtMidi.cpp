@@ -554,6 +554,12 @@ extern "C" const RtMidi::Api rtmidi_compiled_apis[] = {
 #if defined(__UNIX_JACK__)
   RtMidi::UNIX_JACK,
 #endif
+// WMS is listed before WinMM so that UNSPECIFIED auto-detection picks WMS
+// when the SDK is installed.  If WMS init fails (SDK not present), its
+// getPortCount() returns 0 and the search continues to WinMM.
+#if defined(__WINDOWS_MIDI_SERVICES__)
+  RtMidi::WINDOWS_MIDI_SERVICES,
+#endif
 #if defined(__WINDOWS_MM__)
   RtMidi::WINDOWS_MM,
 #endif
@@ -568,9 +574,6 @@ extern "C" const RtMidi::Api rtmidi_compiled_apis[] = {
 #endif
 #if defined(__AMIDI__)
   RtMidi::ANDROID_AMIDI,
-#endif
-#if defined(__WINDOWS_MIDI_SERVICES__)
-  RtMidi::WINDOWS_MIDI_SERVICES,
 #endif
 #if defined(__RTMIDI_DUMMY__)
   RtMidi::RTMIDI_DUMMY,
@@ -4153,6 +4156,18 @@ private:
 
   IMidiClientInitializer* initializer_{ nullptr };
 };
+}  // namespace WmsInit
+
+// ---------------------------------------------------------------------------
+// RtMidi::isWindowsMidiServicesAvailable() — lightweight COM probe.
+// Creates a temporary MidiDesktopAppSdkInitializer (released on return),
+// completely independent from the persistent s_initializer_ used by
+// WinMidiServicesClass::init_sdk().
+// ---------------------------------------------------------------------------
+bool RtMidi::isWindowsMidiServicesAvailable()
+{
+    WmsInit::MidiDesktopAppSdkInitializer probe;
+    return probe.InitializeSdkRuntime() && probe.EnsureServiceAvailable();
 }
 
 // ---------------------------------------------------------------------------

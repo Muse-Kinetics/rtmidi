@@ -222,6 +222,16 @@ class RTMIDI_DLL_PUBLIC RtMidi
   */
   static RtMidi::Api getCompiledApiByName( const std::string &name );
 
+#if defined(__WINDOWS_MIDI_SERVICES__)
+  //! Returns true if the Windows MIDI Services SDK runtime is installed and the service is running.
+  /*!
+    Uses the WMS Desktop App SDK COM bootstrapper (the same probe that the WMS backend itself
+    uses on first initialisation).  Safe to call before any RtMidi instances are created.
+    Always returns false when compiled without __WINDOWS_MIDI_SERVICES__.
+  */
+  static bool isWindowsMidiServicesAvailable();
+#endif
+
   //! Pure virtual openPort() function.
   virtual void openPort( unsigned int portNumber = 0, const std::string &portName = std::string( "RtMidi" ) ) = 0;
 
