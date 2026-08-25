@@ -128,7 +128,8 @@ class MidiOutCore: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
+  void drain( void );
 
  protected:
   MIDIClientRef getCoreMidiClientSingleton(const std::string& clientName) throw();
@@ -491,7 +492,7 @@ class MidiOutDummy: public MidiOutApi
   void setPortName( const std::string &/*portName*/ ) {};
   unsigned int getPortCount( void ) { return 0; }
   std::string getPortName( unsigned int /*portNumber*/ ) { return ""; }
-  void sendMessage( const unsigned char * /*message*/, size_t /*size*/ ) {}
+  int sendMessage( const unsigned char * /*message*/, size_t /*size*/ ) { return 0; }
 
  protected:
   void initialize( const std::string& /*clientName*/ ) {}
@@ -1024,6 +1025,8 @@ MidiOutApi :: ~MidiOutApi( void )
 
 // A structure to hold variables related to the CoreMIDI API
 // implementation.
+struct CoreSysexSend; // defined just below CoreMidiData
+
 struct CoreMidiData {
   MIDIClientRef client;
   MIDIPortRef port;
@@ -1031,7 +1034,41 @@ struct CoreMidiData {
   MIDIEndpointRef destinationId;
   unsigned long long lastTime;
   MIDISysexSendRequest sysexreq;
+
+  // SysEx framing state, persistent across sendMessage() calls so a SysEx sent
+  // in fragments (chunked/paced) is tracked and forwarded correctly. See
+  // MidiOutCore::sendMessage. (Restores flow-controlled MIDISendSysex, undoing
+  // the 2014 regression that switched to unpaced MIDISend - commit 94a04ef.)
+  bool sysexInProgress = false;              // seen 0xF0, not yet 0xF7 / terminated
+  std::vector<unsigned char> sysexRemainder; // trailing <3-byte continuation held for next call
+  std::vector<CoreSysexSend*> pendingSysex;  // in-flight async MIDISendSysex requests
 };
+
+// One in-flight MIDISendSysex request; owns the byte buffer so both outlive the
+// asynchronous send. We do NOT rely on the completion proc to free it (that
+// proc's dispatch can require a run loop the caller may not be running).
+// Instead we poll req.complete - which CoreMIDI sets from its own send thread
+// with no run loop needed (verified: a 30 KB MIDISendSysex drains to
+// bytesToSend==0 while the calling thread merely sleeps) - and sweep in
+// sendMessage() and on teardown.
+struct CoreSysexSend {
+  MIDISysexSendRequest req;
+  std::vector<unsigned char> buf;
+};
+
+// MIDISendSysex requires a non-NULL completion proc; ours is a no-op because
+// freeing is driven by the req.complete sweep above.
+static void coreSysexNoop( MIDISysexSendRequest * ) {}
+
+// Free every finished request (req.complete). Called on the sending thread only.
+static void coreSysexSweep( CoreMidiData *data )
+{
+  std::vector<CoreSysexSend*> &v = data->pendingSysex;
+  for ( size_t i = 0; i < v.size(); ) {
+    if ( v[i]->req.complete ) { delete v[i]; v.erase( v.begin() + i ); }
+    else ++i;
+  }
+}
 
 static MIDIClientRef CoreMidiClientSingleton = 0;
 
@@ -1553,6 +1590,16 @@ MidiOutCore :: ~MidiOutCore( void )
 
   // Cleanup.
   CoreMidiData *data = static_cast<CoreMidiData *> (apiData_);
+  // Drain in-flight asynchronous MIDISendSysex requests before tearing down.
+  // Poll req.complete (CoreMIDI sets it from its own send thread; no run loop
+  // needed) and free finished ones; bounded so a stalled send can't hang us.
+  for ( int spins = 0; !data->pendingSysex.empty() && spins < 60000; ++spins ) {
+    coreSysexSweep( data );
+    if ( data->pendingSysex.empty() ) break;
+    usleep( 1000 );
+  }
+  for ( size_t i = 0; i < data->pendingSysex.size(); ++i ) delete data->pendingSysex[i];
+  data->pendingSysex.clear();
   if ( data->endpoint ) MIDIEndpointDispose( data->endpoint );
   delete data;
 }
@@ -1731,61 +1778,144 @@ void MidiOutCore :: openVirtualPort( const std::string &portName )
   data->endpoint = endpoint;
 }
 
-void MidiOutCore :: sendMessage( const unsigned char *message, size_t size )
+int MidiOutCore :: sendMessage( const unsigned char *message, size_t size )
 {
-  // We use the MIDISendSysex() function to asynchronously send sysex
-  // messages.  Otherwise, we use a single CoreMidi MIDIPacket.
-  unsigned int nBytes = static_cast<unsigned int> (size);
-  if ( nBytes == 0 ) {
+  if ( size == 0 ) {
     errorString_ = "MidiOutCore::sendMessage: no data in message argument!";
     error( RtMidiError::WARNING, errorString_ );
-    return;
+    return -1;
   }
 
-  MIDITimeStamp timeStamp = AudioGetCurrentHostTime();
   CoreMidiData *data = static_cast<CoreMidiData *> (apiData_);
-  OSStatus result;
 
-  ByteCount bufsize = nBytes > 65535 ? 65535 : nBytes;
-  const size_t kBufferSize = bufsize + 16; // pad for other struct members
-  std::vector<Byte> buffer(kBufferSize);
-  ByteCount listSize = static_cast<ByteCount>(buffer.size());
-  MIDIPacketList *packetList = (MIDIPacketList*)buffer.data();
-
-  ByteCount remainingBytes = nBytes;
-  while ( remainingBytes ) {
-    MIDIPacket *packet = MIDIPacketListInit( packetList );
-    // A MIDIPacketList can only contain a maximum of 64K of data, so if our message is longer,
-    // break it up into chunks of 64K or less and send out as a MIDIPacketList with only one
-    // MIDIPacket. Here, we reuse the memory allocated above on the stack for all.
-    ByteCount bytesForPacket = remainingBytes > 65535 ? 65535 : remainingBytes;
-    const Byte* dataStartPtr = (const Byte *) &message[nBytes - remainingBytes];
-    packet = MIDIPacketListAdd( packetList, listSize, packet, timeStamp, bytesForPacket, dataStartPtr );
-    remainingBytes -= bytesForPacket;
-
-    if ( !packet ) {
-      errorString_ = "MidiOutCore::sendMessage: could not allocate packet list";
-      error( RtMidiError::DRIVER_ERROR, errorString_ );
-      return;
-    }
-
-    // Send to any destinations that may have connected to us.
-    if ( data->endpoint ) {
-      result = MIDIReceived( data->endpoint, packetList );
-      if ( result != noErr ) {
-        errorString_ = "MidiOutCore::sendMessage: error sending MIDI to virtual destinations.";
-        error( RtMidiError::WARNING, errorString_ );
+  // Send a run of NON-SysEx bytes (channel/system/real-time) the classic way:
+  // MIDIPacket(s) via MIDIReceived (virtual source) and/or MIDISend (connected).
+  auto sendShort = [&]( const unsigned char *bytes, size_t n ) -> void {
+    if ( n == 0 ) return;
+    MIDITimeStamp timeStamp = AudioGetCurrentHostTime();
+    ByteCount remaining = n;
+    const size_t kBufferSize = ( n > 65535 ? 65535 : n ) + 16;
+    std::vector<Byte> buffer( kBufferSize );
+    ByteCount listSize = static_cast<ByteCount>( buffer.size() );
+    MIDIPacketList *packetList = (MIDIPacketList*) buffer.data();
+    while ( remaining ) {
+      MIDIPacket *packet = MIDIPacketListInit( packetList );
+      ByteCount forPacket = remaining > 65535 ? 65535 : remaining;
+      const Byte *startPtr = (const Byte *) &bytes[n - remaining];
+      packet = MIDIPacketListAdd( packetList, listSize, packet, timeStamp, forPacket, startPtr );
+      remaining -= forPacket;
+      if ( !packet ) {
+        errorString_ = "MidiOutCore::sendMessage: could not allocate packet list";
+        error( RtMidiError::DRIVER_ERROR, errorString_ );
+        return;
+      }
+      if ( data->endpoint ) {
+        if ( MIDIReceived( data->endpoint, packetList ) != noErr ) {
+          errorString_ = "MidiOutCore::sendMessage: error sending MIDI to virtual destinations.";
+          error( RtMidiError::WARNING, errorString_ );
+        }
+      }
+      if ( connected_ ) {
+        if ( MIDISend( data->port, data->destinationId, packetList ) != noErr ) {
+          errorString_ = "MidiOutCore::sendMessage: error sending MIDI message to port.";
+          error( RtMidiError::WARNING, errorString_ );
+        }
       }
     }
+  };
 
-    // And send to an explicit destination port if we're connected.
+  // Forward a SysEx fragment. To a connected destination we use the
+  // flow-controlled, asynchronous MIDISendSysex() (paced by CoreMIDI, honoring
+  // USB back-pressure); successive fragments reassemble into one continuous
+  // SysEx on the wire. A virtual source can't be a MIDISendSysex destination,
+  // so it falls back to the packet-list path.
+  auto sendSysexFrag = [&]( const std::vector<unsigned char> &bytes ) -> void {
+    if ( bytes.empty() ) return;
+    if ( data->endpoint ) sendShort( bytes.data(), bytes.size() );
     if ( connected_ ) {
-      result = MIDISend( data->port, data->destinationId, packetList );
-      if ( result != noErr ) {
-        errorString_ = "MidiOutCore::sendMessage: error sending MIDI message to port.";
+      coreSysexSweep( data ); // reap finished sends before queuing another
+      CoreSysexSend *s = new CoreSysexSend();
+      s->buf = bytes;
+      s->req.destination = data->destinationId;
+      s->req.data = s->buf.data();
+      s->req.bytesToSend = static_cast<UInt32>( s->buf.size() );
+      s->req.complete = false;
+      s->req.reserved[0] = s->req.reserved[1] = s->req.reserved[2] = 0;
+      s->req.completionProc = coreSysexNoop;
+      s->req.completionRefCon = s;
+      if ( MIDISendSysex( &s->req ) == noErr ) {
+        data->pendingSysex.push_back( s );
+      } else {
+        delete s;
+        errorString_ = "MidiOutCore::sendMessage: MIDISendSysex failed.";
         error( RtMidiError::WARNING, errorString_ );
       }
     }
+  };
+
+  size_t i = 0;
+  while ( i < size ) {
+    unsigned char b = message[i];
+
+    // System real-time (0xF8..0xFF) passes straight through, even mid-SysEx,
+    // without disturbing SysEx state.
+    if ( b >= 0xF8 ) { sendShort( &message[i], 1 ); ++i; continue; }
+
+    if ( !data->sysexInProgress ) {
+      if ( b == 0xF0 ) {
+        data->sysexInProgress = true; // fall through to SysEx accumulation
+      } else {
+        // Non-SysEx run: up to the next 0xF0 or real-time byte.
+        size_t j = i;
+        while ( j < size && message[j] < 0xF8 && message[j] != 0xF0 ) ++j;
+        sendShort( &message[i], j - i );
+        i = j;
+        continue;
+      }
+    }
+
+    // In SysEx: accumulate (prepending any held remainder) until 0xF7, a
+    // non-real-time status byte (ends the SysEx with NO synthetic 0xF7), a
+    // real-time byte, or the end of this buffer.
+    std::vector<unsigned char> frag;
+    frag.swap( data->sysexRemainder );
+    bool ended = false;
+    size_t j = i;
+    // Consume a leading 0xF0 (the SysEx start) so the loop below doesn't mistake
+    // it for a terminating status byte (0xF0 is >= 0x80).
+    if ( j < size && message[j] == 0xF0 ) { frag.push_back( message[j] ); ++j; }
+    while ( j < size ) {
+      unsigned char c = message[j];
+      if ( c >= 0xF8 ) break;                              // real-time: handle at top next loop
+      if ( c == 0xF7 ) { frag.push_back( c ); ++j; ended = true; break; } // complete SysEx
+      if ( c >= 0x80 ) { ended = true; break; }            // status mid-SysEx: ends it, do NOT consume
+      frag.push_back( c ); ++j;
+    }
+    i = j;
+    if ( ended ) data->sysexInProgress = false;
+
+    // Buffer a trailing <3-byte continuation (avoids emitting a partial 3-byte
+    // USB-MIDI group); flush it once it fills to >=3 or the SysEx ends.
+    if ( !ended && frag.size() < 3 ) {
+      data->sysexRemainder = frag;
+    } else {
+      sendSysexFrag( frag );
+    }
+  }
+  return static_cast<int>( size );
+}
+
+void MidiOutCore :: drain( void )
+{
+  CoreMidiData *data = static_cast<CoreMidiData *> (apiData_);
+  // Block until every in-flight asynchronous MIDISendSysex request reports
+  // req.complete (CoreMIDI sets it from its own send thread - no run loop
+  // needed). After this returns, all output handed to sendMessage() is on the
+  // wire, so a caller can time a real inter-message gap.
+  while ( !data->pendingSysex.empty() ) {
+    coreSysexSweep( data );
+    if ( data->pendingSysex.empty() ) break;
+    usleep( 500 );
   }
 }
 
@@ -3250,6 +3380,16 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     }
 
     // Unprepare the buffer and MIDIHDR.
+    // TODO(WinMM): this makes sendMessage() synchronous (blocks until MHDR_DONE
+    // via the STILLPLAYING spin) - the opposite of the CoreMIDI async path, and
+    // it freezes the caller for the whole SysEx (bad for GUI hosts). For the
+    // async + drain() model (matching MidiOutCore): keep the MIDIHDR + buffer
+    // in a pending list, return without waiting, and implement MidiOutWinMM::
+    // drain() to wait for MHDR_DONE (poll the flag or a MOM_DONE callback via
+    // midiOutOpen(... CALLBACK_FUNCTION/EVENT/THREAD)), then Unprepare + free.
+    // Until then, MidiOutWinMM inherits the base no-op drain() - which is
+    // already correct here because sendMessage blocks. Verify on Windows whether
+    // MHDR_DONE means on-the-wire (device back-pressure) or merely queued.
     while ( MIDIERR_STILLPLAYING == midiOutUnprepareHeader( data->outHandle, &sysex, sizeof ( MIDIHDR ) ) ) Sleep( 1 );
     free( buffer );
   }
