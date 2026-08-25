@@ -174,7 +174,7 @@ class MidiOutJack: public MidiOutApi
   void setPortName( const std::string &portName);
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
 
  protected:
   std::string clientName;
@@ -218,7 +218,7 @@ class MidiOutAlsa: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
 
  protected:
   void initialize( const std::string& clientName );
@@ -259,7 +259,7 @@ class MidiOutWinMM: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
 
  protected:
   void initialize( const std::string& clientName );
@@ -301,7 +301,7 @@ public:
     void setPortName(const std::string& portName) override;
     unsigned int getPortCount(void) override;
     std::string getPortName(unsigned int portNumber) override;
-    void sendMessage(const unsigned char* message, size_t size) override;
+    int sendMessage(const unsigned char* message, size_t size) override;
 
 protected:
     void initialize(const std::string& clientName) override;
@@ -352,7 +352,7 @@ class MidiOutWeb: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
 
  protected:
   void initialize( const std::string& clientName );
@@ -411,7 +411,7 @@ class MidiOutAndroid: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
 
   void initialize( const std::string& clientName );
   void connect();
@@ -454,7 +454,7 @@ public:
     void setPortName( const std::string& portName ) override;
     unsigned int getPortCount( void ) override;
     std::string getPortName( unsigned int portNumber ) override;
-    void sendMessage( const unsigned char* message, size_t size ) override;
+    int sendMessage( const unsigned char* message, size_t size ) override;
 protected:
     void initialize( const std::string& clientName ) override;
 };
@@ -2763,7 +2763,7 @@ void MidiOutAlsa :: openVirtualPort( const std::string &portName )
   }
 }
 
-void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
+int MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
 {
   long result;
   AlsaMidiData *data = static_cast<AlsaMidiData *> (apiData_);
@@ -2774,14 +2774,14 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
     if ( result != 0 ) {
       errorString_ = "MidiOutAlsa::sendMessage: ALSA error resizing MIDI event buffer.";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
-      return;
+      return -1;
     }
     free (data->buffer);
     data->buffer = (unsigned char *) malloc( data->bufferSize );
     if ( data->buffer == NULL ) {
       errorString_ = "MidiOutAlsa::initialize: error allocating buffer memory!\n\n";
       error( RtMidiError::MEMORY_ERROR, errorString_ );
-      return;
+      return -1;
     }
   }
 
@@ -2799,13 +2799,13 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
     if ( result < 0 ) {
       errorString_ = "MidiOutAlsa::sendMessage: event parsing error!";
       error( RtMidiError::WARNING, errorString_ );
-      return;
+      return -1;
     }
 
     if ( ev.type == SND_SEQ_EVENT_NONE ) {
       errorString_ = "MidiOutAlsa::sendMessage: incomplete message!";
       error( RtMidiError::WARNING, errorString_ );
-      return;
+      return -1;
     }
 
     offset += result;
@@ -2815,10 +2815,11 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
     if ( result < 0 ) {
       errorString_ = "MidiOutAlsa::sendMessage: error sending MIDI message to port.";
       error( RtMidiError::WARNING, errorString_ );
-      return;
+      return -1;
     }
   }
   snd_seq_drain_output( data->seq );
+  return static_cast<int>( nBytes );
 }
 
 #endif // __LINUX_ALSA__
@@ -3327,15 +3328,15 @@ void MidiOutWinMM :: openVirtualPort( const std::string &/*portName*/ )
   error( RtMidiError::WARNING, errorString_ );
 }
 
-void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
+int MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 {
-  if ( !connected_ ) return;
+  if ( !connected_ ) return -1;
 
   unsigned int nBytes = static_cast<unsigned int>(size);
   if ( nBytes == 0 ) {
     errorString_ = "MidiOutWinMM::sendMessage: message argument is empty!";
     error( RtMidiError::WARNING, errorString_ );
-    return;
+    return -1;
   }
 
   MMRESULT result;
@@ -3347,7 +3348,7 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     if ( buffer == NULL ) {
       errorString_ = "MidiOutWinMM::sendMessage: error allocating sysex message memory!";
       error( RtMidiError::MEMORY_ERROR, errorString_ );
-      return;
+      return -1;
     }
 
     // Copy data to buffer.
@@ -3363,19 +3364,52 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
       free( buffer );
       errorString_ = "MidiOutWinMM::sendMessage: error preparing sysex header.";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
-      return;
+      return -1;
     }
 
     // Send the message.
     if (connected_)
     {
-        result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
-        if ( result != MMSYSERR_NOERROR ) {
+        // MIDIERR_NOTREADY ("the hardware is busy with other data") is WinMM's
+        // documented device-busy signal, not a real transport failure - a
+        // device that's mid-way through a blocking operation (e.g. a legacy
+        // SoftStep/12 Step trojan-bootloader sector triggering its CRC-verify +
+        // flash-patch + jump at a bank boundary) can legitimately return this
+        // for a brief window. CoreMIDI's flow-controlled MIDISendSysex absorbs
+        // an equivalent stall transparently underneath the app; WinMM does not
+        // retry on our behalf, so we must.
+        //
+        // On real hardware (2026-08-25), this same transient stall came back
+        // as plain MMSYSERR_ERROR (1, "unspecified error") instead of the
+        // specific MIDIERR_NOTREADY - deterministically, on the exact sector
+        // whose data-close triggers the device's blocking CRC-verify/flash-
+        // patch/jump, unrelated to buffer size (777 bytes vs. the routinely-
+        // succeeding 665-byte sectors either side of it). This device is
+        // accessed through Windows MIDI Services' legacy WinMM compatibility
+        // shim rather than a native WinMM driver, which evidently collapses a
+        // transient device-busy condition into the generic code instead of
+        // the specific one a native driver would report. So: retry on both.
+        // Structural failures (bad handle, no driver, device removed) use
+        // their own distinct codes and are not in this set, so they still
+        // fail immediately without waiting out the retry budget.
+        const int kBusyMaxRetries = 100;
+        const DWORD kBusyRetryDelayMs = 20; // 100 x 20ms = up to ~2s of retry budget
+        int busyAttempts = 0;
+        for (;;) {
+          result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
+          if ( result == MMSYSERR_NOERROR ) break;
+          if ( (result == MIDIERR_NOTREADY || result == MMSYSERR_ERROR) && busyAttempts < kBusyMaxRetries ) {
+            ++busyAttempts;
+            Sleep( kBusyRetryDelayMs );
+            continue;
+          }
           midiOutUnprepareHeader( data->outHandle, &sysex, sizeof( MIDIHDR ) );
           free( buffer );
-          errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message.";
+          errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message (MMRESULT " +
+                          std::to_string(result) +
+                          (busyAttempts > 0 ? ", still failing after " + std::to_string(busyAttempts) + " retries" : "") + ").";
           error( RtMidiError::DRIVER_ERROR, errorString_ );
-          return;
+          return -1;
         }
     }
 
@@ -3408,8 +3442,11 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     if ( result != MMSYSERR_NOERROR ) {
       errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message. Error code: " + std::to_string(result);
       error( RtMidiError::DRIVER_ERROR, errorString_ );
+      return -1;
     }
   }
+
+  return static_cast<int>( nBytes );
 }
 
 #endif  // __WINDOWS_MM__
@@ -4166,16 +4203,16 @@ void MidiOutWinUWP::openVirtualPort(const std::string&/*portName*/)
     error(RtMidiError::WARNING, errorString_);
 }
 
-void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
+int MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 {
     if (!connected_)
-        return;
+        return -1;
 
     if (size == 0)
     {
         errorString_ = "MidiOutWinUWP::sendMessage: message argument is empty!";
         error(RtMidiError::WARNING, errorString_);
-        return;
+        return -1;
     }
 
     UWPMidiClass* data{ static_cast<UWPMidiClass*>(apiData_) };
@@ -4183,7 +4220,9 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
     {
         errorString_ = "MidiOutWinUWP::sendMessage: error sending message.";
         error(RtMidiError::DRIVER_ERROR, errorString_);
+        return -1;
     }
+    return static_cast<int>( size );
 }
 
 #endif  // __WINDOWS_UWP__
@@ -5297,21 +5336,33 @@ void MidiOutWinMidi2::setPortName(const std::string&)
     error(RtMidiError::WARNING, errorString_);
 }
 
-void MidiOutWinMidi2::sendMessage(const unsigned char* message, size_t size)
+int MidiOutWinMidi2::sendMessage(const unsigned char* message, size_t size)
 {
-    if (!connected_) return;
+    if (!connected_) return -1;
     if (size == 0)
     {
         errorString_ = "MidiOutWinMidi2::sendMessage: message is empty!";
         error(RtMidiError::WARNING, errorString_);
-        return;
+        return -1;
     }
     WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
     if (!data->send_buffer(message, size))
     {
         errorString_ = "MidiOutWinMidi2::sendMessage: error sending message.";
         error(RtMidiError::DRIVER_ERROR, errorString_);
+        return -1;
     }
+    // NOTE: send_buffer() (SendMidiMessagesRaw/SendMultipleMessagesWordArray)
+    // returns once WMS accepts the message, NOT once it is actually on the
+    // wire - unlike MidiOutWinMM::sendMessage (which blocks on MHDR_DONE) or
+    // MidiOutCore's drain() (which waits on CoreMIDI's real completion
+    // callback). This class inherits MidiOutApi's no-op drain(), so callers
+    // pacing by drain() + a delay (see bootloaderSend.h) get NO real
+    // backpressure signal from this backend - only whatever gap they add
+    // themselves. Unconfirmed whether that matters in practice for the WMS
+    // transport's own internal pacing; flagged here rather than assumed
+    // either way pending real-hardware validation.
+    return static_cast<int>( size );
 }
 
 // ---------------------------------------------------------------------------
@@ -5888,13 +5939,19 @@ void MidiOutJack :: setPortName( const std::string &portName )
 #endif
 }
 
-void MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
+int MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
 {
   int nBytes = static_cast<int>(size);
   JackMidiData *data = static_cast<JackMidiData *> (apiData_);
 
-  if ( size + sizeof(nBytes) > (size_t) data->buffMaxWrite )
-      return;
+  // Previously a silent drop (bare return, no error()) even under the old
+  // void signature - a message too large for the ring buffer vanished with
+  // no diagnostic at all. Now reported like every other backend's failure.
+  if ( size + sizeof(nBytes) > (size_t) data->buffMaxWrite ) {
+      errorString_ = "MidiOutJack::sendMessage: message too large for the ring buffer!";
+      error( RtMidiError::WARNING, errorString_ );
+      return -1;
+  }
 
   while ( jack_ringbuffer_write_space(data->buff) < sizeof(nBytes) + size )
       sched_yield();
@@ -5902,6 +5959,7 @@ void MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
   // Write full message to buffer
   jack_ringbuffer_write( data->buff, ( char * ) &nBytes, sizeof( nBytes ) );
   jack_ringbuffer_write( data->buff, ( const char * ) message, nBytes );
+  return nBytes;
 }
 
 #endif  // __UNIX_JACK__
@@ -6198,22 +6256,45 @@ std::string MidiOutWeb::getPortName( unsigned int portNumber )
   return shim->getPortName( portNumber, false );
 }
 
-void MidiOutWeb::sendMessage( const unsigned char *message, size_t size )
+int MidiOutWeb::sendMessage( const unsigned char *message, size_t size )
 {
-  if( open_port_number < 0 )
-    return;
+  if( open_port_number < 0 ) {
+    errorString_ = "MidiOutWeb::sendMessage: no port is open!";
+    error( RtMidiError::WARNING, errorString_ );
+    return -1;
+  }
 
-  MAIN_THREAD_EM_ASM( {
+  // Previously MAIN_THREAD_EM_ASM (void) - the JS side had no way to report
+  // anything back to C++ at all; a missing port just did a console.log() and
+  // silently returned. MAIN_THREAD_EM_ASM_INT lets the JS block evaluate to a
+  // real value (0 = failure, 1 = success) that crosses back into the C++
+  // return value. output.send() can also throw a DOMException on malformed
+  // data, so that's now caught and reported the same way instead of being an
+  // uncaught JS exception.
+  const int ok = MAIN_THREAD_EM_ASM_INT( {
     var output = _rtmidi_internals_get_port_by_number( $0, false );
     if( output == null ) {
       console.log( "Port #" + $0 + " could not be found.");
-      return;
+      return 0;
     }
-    var buf = new ArrayBuffer ($2);
-    var msg = new Uint8Array( buf );
-    msg.set( new Uint8Array( Module.HEAPU8.buffer.slice( $1, $1 + $2 ) ) );
-    output.send( msg );
+    try {
+      var buf = new ArrayBuffer ($2);
+      var msg = new Uint8Array( buf );
+      msg.set( new Uint8Array( Module.HEAPU8.buffer.slice( $1, $1 + $2 ) ) );
+      output.send( msg );
+    } catch (e) {
+      console.log( "MidiOutWeb sendMessage failed: " + e );
+      return 0;
+    }
+    return 1;
   }, open_port_number, message, size );
+
+  if ( !ok ) {
+    errorString_ = "MidiOutWeb::sendMessage: error sending MIDI message (port not found, or send() failed).";
+    error( RtMidiError::DRIVER_ERROR, errorString_ );
+    return -1;
+  }
+  return static_cast<int>( size );
 }
 
 void MidiOutWeb::initialize( const std::string& clientName )
@@ -6662,8 +6743,16 @@ void MidiOutAndroid :: setPortName( const std::string &portName ) {
   error( RtMidiError::WARNING, errorString_ );
 }
 
-void MidiOutAndroid :: sendMessage( const unsigned char *message, size_t size ) {
-  AMidiInputPort_send(midiInputPort, (uint8_t*)message, size);
+int MidiOutAndroid :: sendMessage( const unsigned char *message, size_t size ) {
+  // AMidiInputPort_send() already returns the number of bytes sent on
+  // success, or a negative media_status_t error code - exactly the
+  // convention this interface wants. Previously discarded entirely.
+  media_status_t result = AMidiInputPort_send(midiInputPort, (uint8_t*)message, size);
+  if ( result < 0 ) {
+    errorString_ = "MidiOutAndroid::sendMessage: AMidiInputPort_send failed with error " + std::to_string(static_cast<int>(result));
+    error( RtMidiError::DRIVER_ERROR, errorString_ );
+  }
+  return static_cast<int>( result );
 }
 
 #endif  // __AMIDI__

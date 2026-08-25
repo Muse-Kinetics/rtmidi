@@ -46,6 +46,7 @@ set(RTMIDI_TARGETNAME_UNINSTALL "rt_uninstall" CACHE STRING "Name of 'uninstall'
 option(RTMIDI_API_JACK "Compile with JACK support." ${HAVE_JACK})
 option(RTMIDI_API_WINMM "Compile with WINMM support." ${WIN32})
 option(RTMIDI_API_WMS "Compile with Windows MIDI Services support." OFF)
+option(RTMIDI_API_UWP "Compile with legacy Windows.Devices.Midi (UWP) support." OFF)
 option(RTMIDI_API_CORE "Compile with CoreMIDI support." ${APPLE})
 option(RTMIDI_API_ALSA "Compile with ALSA support." ${ALSA})
 option(RTMIDI_API_AMIDI "Compile with Android support." ${ANDROID})
@@ -186,6 +187,33 @@ if(RTMIDI_API_WMS)
   if(RTMIDI_USE_WMS_COM_RAW)
     list(APPEND API_DEFS "-DRTMIDI_USE_WMS_COM_RAW")
   endif()
+endif()
+
+# Windows.Devices.Midi (legacy UWP MIDI API)
+#
+# Unlike WMS, this is a built-in OS namespace, not a separate SDK component -
+# modern Windows 10 SDKs (10.0.17763+) ship its C++/WinRT projection headers
+# pre-built under <SDK>/Include/<version>/cppwinrt/winrt/Windows.Devices.Midi.h,
+# so no cppwinrt.exe projection-generation step is needed the way WMS's
+# third-party Microsoft.Windows.Devices.Midi2.winmd requires. Just the same
+# base WinRT-from-a-classic-desktop-app plumbing (find the SDK's cppwinrt
+# include dir, link the base WinRT activation libs).
+if(RTMIDI_API_UWP)
+  if(NOT WIN32)
+    message(FATAL_ERROR "RTMIDI_API_UWP is only supported on Windows")
+  endif()
+
+  # C++/WinRT requires C++17, same as WMS above.
+  if(CMAKE_CXX_STANDARD VERSION_LESS 17)
+    set(CMAKE_CXX_STANDARD 17)
+  endif()
+
+  find_package(CppWinRT REQUIRED)
+
+  list(APPEND API_DEFS "-D__WINDOWS_UWP__")
+  list(APPEND API_LIST "uwp")
+  list(APPEND INCDIRS "${CppWinRT_INCLUDE_DIR}")
+  list(APPEND LINKLIBS windowsapp runtimeobject ole32)
 endif()
 
 # CoreMIDI
