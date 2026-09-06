@@ -1963,6 +1963,7 @@ struct AlsaMidiData {
   snd_seq_real_time_t lastTime;
   int queue_id; // an input queue is needed to get timestamped events
   int trigger_fds[2];
+  bool sysexInProgress = false; // seen 0xF0, not yet 0xF7 (output side)
 };
 
 #define PORT_TYPE( pinfo, bits ) ((snd_seq_port_info_get_capability(pinfo) & (bits)) == (bits))
@@ -2768,6 +2769,48 @@ int MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
   long result;
   AlsaMidiData *data = static_cast<AlsaMidiData *> (apiData_);
   unsigned int nBytes = static_cast<unsigned int> (size);
+
+  // A large SysEx may be handed to us across several calls - an opening F0..
+  // with no F7, bare continuation bytes, then a span ending in F7 - so that the
+  // caller can pace the transfer and produce real inter-span gaps on the wire.
+  // snd_midi_event_encode() only emits an event for a self-contained message and
+  // returns SND_SEQ_EVENT_NONE for any such span, which would be dropped below
+  // with "incomplete message!". ALSA's native transport for a large SysEx is
+  // exactly a sequence of SysEx events carrying arbitrary byte spans, which the
+  // receiver concatenates until F7 (the mirror of the reassembly MidiInAlsa
+  // already does), so emit those directly and bypass the encoder. Other backends
+  // (CoreMIDI, WinMM, JACK, Web) already accept partial SysEx this way; this
+  // keeps ALSA consistent with them.
+  if ( nBytes > 0 ) {
+    const unsigned char first = message[0];
+    if ( data->sysexInProgress || first == 0xF0 ) {
+      // Track completion so the next call knows whether it is a continuation.
+      // A non-real-time status byte other than F0 terminates a SysEx too.
+      for ( unsigned int i = 0; i < nBytes; ++i ) {
+        const unsigned char b = message[i];
+        if ( b >= 0xF8 ) continue;               // real-time: does not affect SysEx state
+        if ( i == 0 && b == 0xF0 ) { data->sysexInProgress = true; continue; }
+        if ( b == 0xF7 ) { data->sysexInProgress = false; continue; }
+        if ( b >= 0x80 ) data->sysexInProgress = false; // status byte ends the SysEx
+      }
+
+      snd_seq_event_t ev;
+      snd_seq_ev_clear( &ev );
+      snd_seq_ev_set_source( &ev, data->vport );
+      snd_seq_ev_set_subs( &ev );
+      snd_seq_ev_set_direct( &ev );
+      snd_seq_ev_set_sysex( &ev, nBytes, const_cast<unsigned char *>( message ) );
+      result = snd_seq_event_output( data->seq, &ev );
+      if ( result < 0 ) {
+        errorString_ = "MidiOutAlsa::sendMessage: error sending MIDI message to port.";
+        error( RtMidiError::WARNING, errorString_ );
+        return -1;
+      }
+      snd_seq_drain_output( data->seq );
+      return static_cast<int>( nBytes );
+    }
+  }
+
   if ( nBytes > data->bufferSize ) {
     data->bufferSize = nBytes;
     result = snd_midi_event_resize_buffer( data->coder, nBytes );
@@ -3372,24 +3415,21 @@ int MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     {
         // MIDIERR_NOTREADY ("the hardware is busy with other data") is WinMM's
         // documented device-busy signal, not a real transport failure - a
-        // device that's mid-way through a blocking operation (e.g. a legacy
-        // SoftStep/12 Step trojan-bootloader sector triggering its CRC-verify +
-        // flash-patch + jump at a bank boundary) can legitimately return this
-        // for a brief window. CoreMIDI's flow-controlled MIDISendSysex absorbs
-        // an equivalent stall transparently underneath the app; WinMM does not
-        // retry on our behalf, so we must.
+        // device part-way through a blocking operation (e.g. a firmware-update
+        // SysEx block that triggers a CRC verify and a flash write before the
+        // device can accept more data) can legitimately return this for a brief
+        // window. CoreMIDI's flow-controlled MIDISendSysex absorbs an equivalent
+        // stall transparently; WinMM does not retry on the caller's behalf.
         //
-        // On real hardware (2026-08-25), this same transient stall came back
-        // as plain MMSYSERR_ERROR (1, "unspecified error") instead of the
-        // specific MIDIERR_NOTREADY - deterministically, on the exact sector
-        // whose data-close triggers the device's blocking CRC-verify/flash-
-        // patch/jump, unrelated to buffer size (777 bytes vs. the routinely-
-        // succeeding 665-byte sectors either side of it). This device is
-        // accessed through Windows MIDI Services' legacy WinMM compatibility
-        // shim rather than a native WinMM driver, which evidently collapses a
-        // transient device-busy condition into the generic code instead of
-        // the specific one a native driver would report. So: retry on both.
-        // Structural failures (bad handle, no driver, device removed) use
+        // The same transient stall has also been observed reported as plain
+        // MMSYSERR_ERROR (1, "unspecified error") rather than the specific
+        // MIDIERR_NOTREADY - reproducibly, on the one SysEx block whose close
+        // triggers the device's blocking flash write, and independent of buffer
+        // size. That was through Windows MIDI Services' legacy WinMM
+        // compatibility shim rather than a native WinMM driver, which evidently
+        // collapses a transient device-busy condition into the generic code
+        // instead of the specific one a native driver reports. So: retry on
+        // both. Structural failures (bad handle, no driver, device removed) use
         // their own distinct codes and are not in this set, so they still
         // fail immediately without waiting out the retry budget.
         const int kBusyMaxRetries = 100;
@@ -3414,7 +3454,7 @@ int MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     }
 
     // Unprepare the buffer and MIDIHDR.
-    // TODO(WinMM): this makes sendMessage() synchronous (blocks until MHDR_DONE
+    // FIXME: this makes sendMessage() synchronous (blocks until MHDR_DONE
     // via the STILLPLAYING spin) - the opposite of the CoreMIDI async path, and
     // it freezes the caller for the whole SysEx (bad for GUI hosts). For the
     // async + drain() model (matching MidiOutCore): keep the MIDIHDR + buffer
@@ -4252,10 +4292,10 @@ int MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 #include <winrt/Microsoft.Windows.Devices.Midi2.h>
 #include <winrt/Microsoft.Windows.Devices.Midi2.Messages.h>
 
-// Bootstrapper shim — local COM wrapper so the backend does not depend on the
+// Bootstrapper shim - local COM wrapper so the backend does not depend on the
 // optional NuGet-only header. Without this initialization step, direct WinRT
-// WMS probes on this machine return 0x80040154 (Class not registered) before
-// port enumeration, so the current backend still requires bootstrap.
+// WMS probes can return 0x80040154 (Class not registered) before port
+// enumeration, so the backend still requires this bootstrap step.
 namespace midi2    = winrt::Microsoft::Windows::Devices::Midi2;
 namespace midi2msg = winrt::Microsoft::Windows::Devices::Midi2::Messages;
 
@@ -4338,7 +4378,7 @@ private:
 }  // namespace WmsInit
 
 // ---------------------------------------------------------------------------
-// RtMidi::isWindowsMidiServicesAvailable() — lightweight COM probe.
+// RtMidi::isWindowsMidiServicesAvailable() - lightweight COM probe.
 // Creates a temporary MidiDesktopAppSdkInitializer (released on return),
 // completely independent from the persistent s_initializer_ used by
 // WinMidiServicesClass::init_sdk().
@@ -4350,7 +4390,7 @@ bool RtMidi::isWindowsMidiServicesAvailable()
 }
 
 // ---------------------------------------------------------------------------
-// COM extension interface — inline definition from the IDL.
+// COM extension interface - inline definition from the IDL.
 // Define RTMIDI_USE_WMS_COM_RAW to use SendMidiMessagesRaw instead of
 // the WinRT SendMultipleMessagesWordArray path.
 //
@@ -4464,7 +4504,7 @@ private:
     bool init_sdk();
     void shutdown_sdk();
 
-    // UMP → raw MIDI 1.0 bytes: fires RtMidi callback/queue
+    // UMP -> raw MIDI 1.0 bytes: fires RtMidi callback/queue
     void midi_in_callback(IMidiMessageReceivedEventSource const&,
                           MidiMessageReceivedEventArgs const& args);
 
@@ -4489,11 +4529,11 @@ private:
     // Active UMP group for the open port (set by in_open/out_open)
     uint8_t active_group_{ 0 };
 
-    // Max UMP words per SendMultipleMessages* call — queried from the SDK
+    // Max UMP words per SendMultipleMessages* call - queried from the SDK
     // after Open() via GetSupportedMaxMidiWordsPerTransmission().
     uint32_t max_words_per_call_{ 684u };
 
-    // Stateful MIDI 1.0 → UMP encoder (persists running status and SysEx
+    // Stateful MIDI 1.0 -> UMP encoder (persists running status and SysEx
     // accumulation across send_buffer calls).
     Midi1UmpEncoder encoder_;
 
@@ -4524,12 +4564,12 @@ private:
     static std::condition_variable   s_enum_cv_;
     static bool                      s_enum_ready_;
 
-    // Bootstrapper — held for the process lifetime so the WMS runtime DLL
+    // Bootstrapper - held for the process lifetime so the WMS runtime DLL
     // stays loaded (and the watcher keeps firing) even while individual
-    // WinMidiServicesClass instances are deleted and recreated by KMI_Ports.
+    // WinMidiServicesClass instances are created and destroyed by the caller.
     static std::shared_ptr<WmsInit::MidiDesktopAppSdkInitializer> s_initializer_;
 
-    // COM / WinRT initializer — constructed once for the lifetime of the process
+    // COM / WinRT initializer - constructed once for the lifetime of the process
     static WinMidi2Init wm2_init_;
 };
 
@@ -4635,7 +4675,7 @@ bool WinMidiServicesClass::init_sdk()
 
 void WinMidiServicesClass::shutdown_sdk()
 {
-    // Only clear the instance flag — s_initializer_ is kept alive permanently
+    // Only clear the instance flag - s_initializer_ is kept alive permanently
     // so the WMS runtime and the shared watcher remain valid.
     sdk_ready_ = false;
 }
@@ -4654,7 +4694,7 @@ void WinMidiServicesClass::s_parse_endpoint(
 
     if (gtbs.Size() == 0)
     {
-        // No GTBs — single port at group 0, usable for both IN and OUT.
+        // No GTBs - single port at group 0, usable for both IN and OUT.
         port p;
         p.display_name = ep_name;
         p.device_id    = device_id;
@@ -4665,8 +4705,8 @@ void WinMidiServicesClass::s_parse_endpoint(
     }
 
     // Separate GTBs by direction.
-    //   BlockOutput (device→host) = RtMidi IN
-    //   BlockInput  (host→device) = RtMidi OUT
+    //   BlockOutput (device->host) = RtMidi IN
+    //   BlockInput  (host->device) = RtMidi OUT
     //   Bidirectional             = both
     std::vector<MidiGroupTerminalBlock> in_gtbs, out_gtbs;
     for (auto const& gtb : gtbs)
@@ -4731,7 +4771,7 @@ void WinMidiServicesClass::s_parse_endpoint(
 void WinMidiServicesClass::enumerate_ports(bool for_input)
 {
     // Port lists are maintained by the static MidiEndpointDeviceWatcher started
-    // in init_sdk(). Just copy the appropriate cache — no FindAll() OS call needed.
+    // in init_sdk(). Just copy the appropriate cache - no FindAll() OS call needed.
     std::lock_guard<std::mutex> lk(s_ports_mtx_);
     ports_ = for_input ? s_in_cache_ : s_out_cache_;
 }
@@ -4851,7 +4891,7 @@ void WinMidiServicesClass::midi_in_callback(
 {
     if (!input_data_) return;
 
-    // Timestamp: 100-ns ticks → delta seconds
+    // Timestamp: 100-ns ticks -> delta seconds
     MidiInApi::MidiMessage message;
     uint64_t ts = args.Timestamp();
     if (first_message_)
@@ -4928,14 +4968,14 @@ void WinMidiServicesClass::midi_in_callback(
 
         if (status_nibble == 0x0)
         {
-            // Complete single-packet SysEx — dispatch immediately.
+            // Complete single-packet SysEx - dispatch immediately.
             message.bytes.push_back(0xF0);
             for (uint8_t i = 0; i < n; ++i) message.bytes.push_back(payload[i]);
             message.bytes.push_back(0xF7);
         }
         else if (status_nibble == 0x1)
         {
-            // Start — begin accumulation; do not dispatch yet.
+            // Start - begin accumulation; do not dispatch yet.
             sysex_buf_.clear();
             sysex_buf_.push_back(0xF0);
             for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
@@ -4943,14 +4983,14 @@ void WinMidiServicesClass::midi_in_callback(
         }
         else if (status_nibble == 0x2)
         {
-            // Continue — append to accumulation buffer; do not dispatch yet.
+            // Continue - append to accumulation buffer; do not dispatch yet.
             if (sysex_buf_.empty()) return; // orphaned continue, discard
             for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
             return;
         }
         else if (status_nibble == 0x3)
         {
-            // End — append final bytes, close with F7, then dispatch.
+            // End - append final bytes, close with F7, then dispatch.
             if (sysex_buf_.empty()) return; // orphaned end, discard
             for (uint8_t i = 0; i < n; ++i) sysex_buf_.push_back(payload[i]);
             sysex_buf_.push_back(0xF7);
@@ -4964,7 +5004,7 @@ void WinMidiServicesClass::midi_in_callback(
     }
     else
     {
-        // Unsupported packet type — ignore
+        // Unsupported packet type - ignore
         return;
     }
 
@@ -5085,7 +5125,7 @@ std::string WinMidiServicesClass::wstring_to_utf8(const std::wstring_view wstr)
 }
 
 //*********************************************************************//
-//  API: Windows MIDI Services — MidiInWinMidi2
+//  API: Windows MIDI Services - MidiInWinMidi2
 //*********************************************************************//
 
 MidiInWinMidi2::MidiInWinMidi2(const std::string& clientName, unsigned int queueSizeLimit)
@@ -5188,7 +5228,7 @@ unsigned int MidiInWinMidi2::getPortCount()
 {
     WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
     // Re-enumerate on every call when no port is open, so hot-plug events
-    // (e.g. device rebooting into bootloader) are visible — matching the
+    // (e.g. device rebooting into bootloader) are visible - matching the
     // live-query behaviour of the WinMM backend.
     if (!connected_ && data->is_sdk_ready())
         data->enumerate_ports(true);
@@ -5217,7 +5257,7 @@ double MidiInWinMidi2::getMessage(std::vector<unsigned char>* message)
 }
 
 //*********************************************************************//
-//  API: Windows MIDI Services — MidiOutWinMidi2
+//  API: Windows MIDI Services - MidiOutWinMidi2
 //*********************************************************************//
 
 MidiOutWinMidi2::MidiOutWinMidi2(const std::string& clientName) : MidiOutApi()
@@ -5247,7 +5287,7 @@ void MidiOutWinMidi2::initialize(const std::string& /*clientName*/)
 unsigned int MidiOutWinMidi2::getPortCount()
 {
     WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
-    // Re-enumerate on every call when no port is open — matches WinMM behaviour.
+    // Re-enumerate on every call when no port is open - matches WinMM behaviour.
     if (!connected_ && data->is_sdk_ready())
         data->enumerate_ports(false);
     return static_cast<unsigned int>(data->get_num_ports());
@@ -5356,17 +5396,16 @@ int MidiOutWinMidi2::sendMessage(const unsigned char* message, size_t size)
     // returns once WMS accepts the message, NOT once it is actually on the
     // wire - unlike MidiOutWinMM::sendMessage (which blocks on MHDR_DONE) or
     // MidiOutCore's drain() (which waits on CoreMIDI's real completion
-    // callback). This class inherits MidiOutApi's no-op drain(), so callers
-    // pacing by drain() + a delay (see bootloaderSend.h) get NO real
-    // backpressure signal from this backend - only whatever gap they add
-    // themselves. Unconfirmed whether that matters in practice for the WMS
-    // transport's own internal pacing; flagged here rather than assumed
-    // either way pending real-hardware validation.
+    // callback). This class inherits MidiOutApi's no-op drain(), so a caller
+    // pacing a chunked transfer with drain() + a delay gets NO real
+    // backpressure signal from this backend - only whatever gap it adds
+    // itself. Whether that matters in practice depends on the WMS transport's
+    // own internal pacing, which has not been characterized here.
     return static_cast<int>( size );
 }
 
 // ---------------------------------------------------------------------------
-// RtMidi::checkApiAvailability — WMS implementation
+// RtMidi::checkApiAvailability - WMS implementation
 // ---------------------------------------------------------------------------
 RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
 {
