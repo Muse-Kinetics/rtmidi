@@ -1399,7 +1399,7 @@ static CFStringRef CreateConnectedEndpointName( MIDIEndpointRef endpoint )
   CFMutableStringRef result = CFStringCreateMutable( NULL, 0 );
   CFStringRef str;
   OSStatus err;
-  int i;
+  size_t i;
 
   // Does the endpoint have connections?
   CFDataRef connections = NULL;
@@ -2687,7 +2687,7 @@ struct WinMidiData {
   DWORD lastTime;
   MidiInApi::MidiMessage message;
   std::vector<LPMIDIHDR> sysexBuffer;
-  CRITICAL_SECTION _mutex; // [Patrice] see https://groups.google.com/forum/#!topic/mididev/6OUjHutMpEo
+  CRITICAL_SECTION _mutex; // [Patrice] protects the sysex buffer requeue in midiInputCallback
 };
 
 //*********************************************************************//
