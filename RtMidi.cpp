@@ -3252,7 +3252,20 @@ class UWPMidiInit
 public:
     UWPMidiInit()
     {
-        winrt::init_apartment();
+        // The host process may already have initialized COM with a different
+        // threading model. Tolerate RPC_E_CHANGED_MODE so UWP MIDI init can
+        // proceed rather than throwing; any other failure still propagates.
+        try
+        {
+            winrt::init_apartment( winrt::apartment_type::multi_threaded );
+        }
+        catch ( winrt::hresult_error const& ex )
+        {
+            if ( ex.code() != RPC_E_CHANGED_MODE )
+            {
+                throw;
+            }
+        }
     }
 };
 
