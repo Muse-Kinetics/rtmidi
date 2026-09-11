@@ -2538,6 +2538,7 @@ void MidiOutAlsa :: closePort( void )
     snd_seq_unsubscribe_port( data->seq, data->subscription );
     snd_seq_port_subscribe_free( data->subscription );
     data->subscription = 0;
+    data->sysexInProgress = false;
     connected_ = false;
   }
 }
@@ -2616,6 +2617,11 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
       snd_seq_ev_set_sysex( &ev, nBytes, const_cast<unsigned char *>( message ) );
       result = snd_seq_event_output( data->seq, &ev );
       if ( result < 0 ) {
+        // The failure also ends the SysEx framing state: a caller that hits an
+        // error part-way through abandons that message, and a stale
+        // in-progress flag would route its next, unrelated, message down this
+        // path instead of the encoder.
+        data->sysexInProgress = false;
         errorString_ = "MidiOutAlsa::sendMessage: error sending MIDI message to port.";
         error( RtMidiError::WARNING, errorString_ );
         return;
