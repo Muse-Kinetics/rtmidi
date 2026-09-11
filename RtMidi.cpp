@@ -2598,15 +2598,20 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
   if ( nBytes > 0 ) {
     const unsigned char first = message[0];
     if ( data->sysexInProgress || first == 0xF0 ) {
-      // Track completion so the next call knows whether it is a continuation.
+      // Work out the framing state this buffer leaves behind, but commit it
+      // only once the event has been accepted (below). If the send fails, the
+      // state stays as it was, so a caller that retries the same span gets it
+      // routed the same way; otherwise a retried continuation would fall
+      // through to the encoder and be rejected as an incomplete message.
       // Real-time bytes (0xF8-0xFF) may appear mid-SysEx without ending it;
       // F7 ends it, and so does any other non-real-time status byte.
+      bool nextSysexInProgress = data->sysexInProgress;
       for ( unsigned int i = 0; i < nBytes; ++i ) {
         const unsigned char b = message[i];
         if ( b >= 0xF8 ) continue;
-        if ( b == 0xF0 ) { data->sysexInProgress = true; continue; }
-        if ( b == 0xF7 ) { data->sysexInProgress = false; continue; }
-        if ( b >= 0x80 ) data->sysexInProgress = false;
+        if ( b == 0xF0 ) { nextSysexInProgress = true; continue; }
+        if ( b == 0xF7 ) { nextSysexInProgress = false; continue; }
+        if ( b >= 0x80 ) nextSysexInProgress = false;
       }
 
       snd_seq_event_t ev;
@@ -2617,15 +2622,14 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
       snd_seq_ev_set_sysex( &ev, nBytes, const_cast<unsigned char *>( message ) );
       result = snd_seq_event_output( data->seq, &ev );
       if ( result < 0 ) {
-        // The failure also ends the SysEx framing state: a caller that hits an
-        // error part-way through abandons that message, and a stale
-        // in-progress flag would route its next, unrelated, message down this
-        // path instead of the encoder.
-        data->sysexInProgress = false;
         errorString_ = "MidiOutAlsa::sendMessage: error sending MIDI message to port.";
         error( RtMidiError::WARNING, errorString_ );
         return;
       }
+
+      // The event has been accepted, so the framing state moves on.
+      data->sysexInProgress = nextSysexInProgress;
+
       snd_seq_drain_output( data->seq );
       return;
     }
