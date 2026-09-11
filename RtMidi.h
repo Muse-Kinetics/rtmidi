@@ -529,6 +529,11 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
   /*!
       An exception is thrown if an error occurs during output or an
       output connection was not previously established.
+
+      On some backends, Windows MM in particular, a SysEx message is sent
+      synchronously: this call does not return until the driver has finished
+      with the data, which for a large dump over a slow link can take a
+      noticeable amount of time. Avoid calling it from a user-interface thread.
   */
   int sendMessage( const std::vector<unsigned char> *message );
 
@@ -540,6 +545,11 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       Returns the number of message bytes accepted (sent or buffered), or a
       negative value on error. Callers may ignore the return value; existing
       code that called this as `void` is unaffected.
+
+      On some backends, Windows MM in particular, a SysEx message is sent
+      synchronously: this call does not return until the driver has finished
+      with the data, which for a large dump over a slow link can take a
+      noticeable amount of time. Avoid calling it from a user-interface thread.
 
       \param message A pointer to the MIDI message as raw bytes
       \param size    Length of the MIDI message in bytes
