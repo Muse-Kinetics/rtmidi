@@ -153,6 +153,9 @@ if(RTMIDI_API_WMS)
   if(NOT WIN32)
     message(FATAL_ERROR "RTMIDI_API_WMS is only supported on Windows")
   endif()
+  if(NOT MSVC)
+    message(FATAL_ERROR "RTMIDI_API_WMS requires the MSVC toolset (C++/WinRT)")
+  endif()
 
   # WMS requires C++17 for C++/WinRT
   if(CMAKE_CXX_STANDARD VERSION_LESS 17)
