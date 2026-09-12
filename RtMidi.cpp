@@ -420,6 +420,46 @@ class MidiOutAndroid: public MidiOutApi
 
 #endif
 
+#if defined(__WINDOWS_MIDI_SERVICES__)
+
+class MidiInWinMidi2 : public MidiInApi
+{
+public:
+    MidiInWinMidi2( const std::string& clientName, unsigned int queueSizeLimit );
+    ~MidiInWinMidi2( void ) override;
+    RtMidi::Api getCurrentApi( void ) override { return RtMidi::WINDOWS_MIDI_SERVICES; }
+    void openPort( unsigned int portNumber, const std::string& portName ) override;
+    void openVirtualPort( const std::string& portName ) override;
+    void closePort( void ) override;
+    void setClientName( const std::string& clientName ) override;
+    void setPortName( const std::string& portName ) override;
+    unsigned int getPortCount( void ) override;
+    std::string getPortName( unsigned int portNumber ) override;
+    double getMessage( std::vector<unsigned char>* message ) override;
+protected:
+    void initialize( const std::string& clientName ) override;
+};
+
+class MidiOutWinMidi2 : public MidiOutApi
+{
+public:
+    MidiOutWinMidi2( const std::string& clientName );
+    ~MidiOutWinMidi2( void ) override;
+    RtMidi::Api getCurrentApi( void ) override { return RtMidi::WINDOWS_MIDI_SERVICES; }
+    void openPort( unsigned int portNumber, const std::string& portName ) override;
+    void openVirtualPort( const std::string& portName ) override;
+    void closePort( void ) override;
+    void setClientName( const std::string& clientName ) override;
+    void setPortName( const std::string& portName ) override;
+    unsigned int getPortCount( void ) override;
+    std::string getPortName( unsigned int portNumber ) override;
+    void sendMessage( const unsigned char* message, size_t size ) override;
+protected:
+    void initialize( const std::string& clientName ) override;
+};
+
+#endif  // __WINDOWS_MIDI_SERVICES__
+
 #if defined(__RTMIDI_DUMMY__)
 
 class MidiInDummy: public MidiInApi
@@ -497,6 +537,7 @@ const char* rtmidi_api_names[][2] = {
   { "web"         , "Web MIDI API" },
   { "winuwp"      , "Windows UWP" },
   { "amidi"       , "Android MIDI API" },
+  { "winmidi2"    , "Windows MIDI Services" },
 };
 const unsigned int rtmidi_num_api_names =
   sizeof(rtmidi_api_names)/sizeof(rtmidi_api_names[0]);
@@ -512,6 +553,12 @@ extern "C" const RtMidi::Api rtmidi_compiled_apis[] = {
 #endif
 #if defined(__UNIX_JACK__)
   RtMidi::UNIX_JACK,
+#endif
+// WMS is listed before WinMM so that UNSPECIFIED auto-detection picks WMS
+// when the SDK is installed.  If WMS init fails (SDK not present), its
+// getPortCount() returns 0 and the search continues to WinMM.
+#if defined(__WINDOWS_MIDI_SERVICES__)
+  RtMidi::WINDOWS_MIDI_SERVICES,
 #endif
 #if defined(__WINDOWS_MM__)
   RtMidi::WINDOWS_MM,
@@ -610,6 +657,10 @@ void RtMidiIn :: openMidiApi( RtMidi::Api api, const std::string &clientName, un
   if (api == WINDOWS_UWP)
       rtapi_ = new MidiInWinUWP(clientName, queueSizeLimit);
 #endif
+#if defined(__WINDOWS_MIDI_SERVICES__)
+  if (api == WINDOWS_MIDI_SERVICES)
+      rtapi_ = new MidiInWinMidi2(clientName, queueSizeLimit);
+#endif
 #if defined(__MACOSX_CORE__)
   if ( api == MACOSX_CORE )
     rtapi_ = new MidiInCore( clientName, queueSizeLimit );
@@ -689,6 +740,10 @@ void RtMidiOut :: openMidiApi( RtMidi::Api api, const std::string &clientName )
 #if defined(__WINDOWS_UWP__)
   if (api == WINDOWS_UWP)
       rtapi_ = new MidiOutWinUWP(clientName);
+#endif
+#if defined(__WINDOWS_MIDI_SERVICES__)
+  if (api == WINDOWS_MIDI_SERVICES)
+      rtapi_ = new MidiOutWinMidi2(clientName);
 #endif
 #if defined(__MACOSX_CORE__)
   if ( api == MACOSX_CORE )
@@ -4179,6 +4234,1547 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 }
 
 #endif  // __WINDOWS_UWP__
+
+
+//*********************************************************************//
+//  API: Windows MIDI Services
+//
+//  Uses the Microsoft.Windows.Devices.Midi2 SDK (Windows MIDI Services).
+//  Requires the Desktop App SDK Runtime installer or Windows 11 24H2+.
+//  https://github.com/microsoft/MIDI
+//
+//*********************************************************************//
+
+#if defined(__WINDOWS_MIDI_SERVICES__)
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <thread>
+
+#include <windows.h>
+#include <combaseapi.h>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Microsoft.Windows.Devices.Midi2.h>
+
+// Bootstrapper shim - local COM wrapper so the backend does not depend on the
+// optional NuGet-only header. Without this initialization step, direct WinRT
+// WMS probes can return 0x80040154 (Class not registered) before port
+// enumeration, so the backend still requires this bootstrap step.
+namespace midi2    = winrt::Microsoft::Windows::Devices::Midi2;
+
+namespace WmsInit
+{
+enum class MidiAppSDKPlatform : unsigned int
+{
+  Platform_x64 = 1,
+  Platform_Arm64X = 4,
+};
+
+struct __declspec(uuid("8087b303-d551-bce2-1ead-a2500d50c580")) IMidiClientInitializer : IUnknown
+{
+  virtual HRESULT __stdcall GetInstalledWindowsMidiServicesSdkVersion(
+    MidiAppSDKPlatform* buildPlatform,
+    USHORT* versionMajor,
+    USHORT* versionMinor,
+    USHORT* versionPatch,
+    LPWSTR* buildSource,
+    LPWSTR* versionName,
+    LPWSTR* versionFullString) = 0;
+
+  virtual HRESULT __stdcall EnsureServiceAvailable() = 0;
+};
+
+struct __declspec(uuid("c3263827-c3b0-bdbd-2500-ce63a3f3f2c3")) MidiClientInitializerUuid
+{
+};
+
+class MidiDesktopAppSdkInitializer
+{
+public:
+  MidiDesktopAppSdkInitializer() = default;
+
+  ~MidiDesktopAppSdkInitializer()
+  {
+    shutdown();
+  }
+
+  MidiDesktopAppSdkInitializer(const MidiDesktopAppSdkInitializer&) = delete;
+  MidiDesktopAppSdkInitializer& operator=(const MidiDesktopAppSdkInitializer&) = delete;
+
+  bool InitializeSdkRuntime()
+  {
+    if (initializer_ != nullptr)
+      return false;
+
+    IMidiClientInitializer* initializer = nullptr;
+    const HRESULT hr = CoCreateInstance(
+      __uuidof(MidiClientInitializerUuid),
+      NULL,
+      CLSCTX_INPROC_SERVER | CLSCTX_FROM_DEFAULT_CONTEXT,
+      __uuidof(IMidiClientInitializer),
+      reinterpret_cast<void**>(&initializer));
+
+    if (FAILED(hr) || initializer == nullptr)
+      return false;
+
+    initializer_ = initializer;
+    return true;
+  }
+
+  bool EnsureServiceAvailable()
+  {
+    return initializer_ != nullptr && SUCCEEDED(initializer_->EnsureServiceAvailable());
+  }
+
+private:
+  void shutdown()
+  {
+    if (initializer_ != nullptr)
+    {
+      initializer_->Release();
+      initializer_ = nullptr;
+    }
+  }
+
+  IMidiClientInitializer* initializer_{ nullptr };
+};
+}  // namespace WmsInit
+
+// ---------------------------------------------------------------------------
+// COM extension interface - inline definition from the IDL.
+// Define RTMIDI_USE_WMS_COM_RAW to use SendMidiMessagesRaw instead of
+// the WinRT SendMultipleMessagesWordArray path.
+//
+// #define RTMIDI_USE_WMS_COM_RAW
+// ---------------------------------------------------------------------------
+struct __declspec(uuid("8087b303-0519-31d1-31d1-000000000020")) IMidiEndpointConnectionRaw : IUnknown
+{
+    virtual UINT32  __stdcall GetSupportedMaxMidiWordsPerTransmission() = 0;
+    virtual BOOL    __stdcall ValidateBufferHasOnlyCompleteUmps(UINT32 wordCount, UINT32* messages) = 0;
+    virtual HRESULT __stdcall SendMidiMessagesRaw(UINT64 timestamp, UINT32 wordCount, UINT32* completeMessages) = 0;
+    virtual HRESULT __stdcall SetMessagesReceivedCallback(IUnknown* callback) = 0;
+    virtual HRESULT __stdcall RemoveMessagesReceivedCallback() = 0;
+};
+
+using midi2::MidiClock;
+using midi2::MidiSession;
+using midi2::MidiEndpointConnection;
+using midi2::MidiEndpointDeviceInformation;
+using midi2::MidiEndpointDeviceInformationFilters;
+using midi2::MidiMessageReceivedEventArgs;
+using midi2::IMidiMessageReceivedEventSource;
+using midi2::MidiGroupTerminalBlock;
+using midi2::MidiGroupTerminalBlockDirection;
+using midi2::MidiEndpointDeviceWatcher;
+using midi2::MidiEndpointDeviceInformationAddedEventArgs;
+using midi2::MidiEndpointDeviceInformationUpdatedEventArgs;
+using midi2::MidiEndpointDeviceInformationRemovedEventArgs;
+
+static const char* const kWmsRuntimeInstallUrl =
+    "https://aka.ms/MidiServicesLatestSdkRuntimeInstaller";
+
+// ---------------------------------------------------------------------------
+// Process-wide COM and SDK runtime setup, done on first use.
+//
+// The backend never initializes COM on a caller's thread: that would fix the
+// apartment of a thread the application owns (for example a GUI thread that
+// later calls OleInitialize). CoIncrementMTAUsage() keeps the process's
+// multi-threaded apartment alive instead, so threads that have not initialized
+// COM run in it implicitly, and threads that have are used as they are.
+//
+// The MTA usage cookie and the SDK bootstrapper are deliberately never
+// released. Holding them costs nothing, and releasing COM objects during
+// static destruction or DLL unload is not safe.
+// ---------------------------------------------------------------------------
+static bool wms_runtime_available()
+{
+    static std::mutex mtx;
+    static CO_MTA_USAGE_COOKIE mta_cookie = nullptr;
+    static WmsInit::MidiDesktopAppSdkInitializer* initializer = nullptr;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (initializer)
+        return true;
+
+    if (!mta_cookie && FAILED(CoIncrementMTAUsage(&mta_cookie)))
+        mta_cookie = nullptr;
+
+    // A failure is not remembered, so a runtime installed while the
+    // application is running is found by the next RtMidi object.
+    auto* candidate = new WmsInit::MidiDesktopAppSdkInitializer();
+    if (candidate->InitializeSdkRuntime() && candidate->EnsureServiceAvailable())
+    {
+        initializer = candidate;
+        return true;
+    }
+    delete candidate;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// MIDI 1.0 byte stream -> UMP word encoder
+//
+// State persists across calls, so chunked SysEx (F0 in one buffer, F7 in a
+// later one), running status, and mixed buffers encode correctly.
+//   - Channel voice (0x80-0xEF)     type 2, 32-bit
+//   - System common (0xF1-0xF6)     type 1, 32-bit
+//   - System real-time (0xF8-0xFF)  type 1, emitted immediately without
+//                                   interrupting SysEx or running status
+//   - SysEx (0xF0 ... 0xF7)         type 3, 64-bit packets
+// ---------------------------------------------------------------------------
+class Midi1UmpEncoder
+{
+public:
+    Midi1UmpEncoder() = default;
+
+    //! Encode bytes from buf[0..len-1], appending UMP words to |out|.
+    //! |group| is the UMP group index (0-15).
+    void encode(const uint8_t* buf, size_t len, uint8_t group,
+                std::vector<uint32_t>& out)
+    {
+        for (size_t i = 0; i < len; ++i)
+        {
+            const uint8_t b = buf[i];
+
+            // System Realtime (0xF8-0xFF): single-byte, emit immediately.
+            // Does NOT cancel running status or interrupt SysEx accumulation.
+            if (b >= 0xF8)
+            {
+                emit_type1(b, 0, 0, group, out);
+                continue;
+            }
+
+            // Status byte (0x80-0xF7)
+            if (b >= 0x80)
+            {
+                if (b == 0xF0) // SYX_START
+                {
+                    // SysEx start: discard any partial channel message.
+                    data_count_      = 0;
+                    running_status_  = 0;
+                    in_sysex_        = true;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                }
+                else if (b == 0xF7) // SYX_END
+                {
+                    // SysEx end: emit end/complete with whatever bytes remain
+                    // (0-6). A 0-byte "end" is valid UMP and maps to just F7
+                    // on the wire for MIDI 1.0 devices.
+                    if (in_sysex_)
+                    {
+                        const uint8_t sn = sysex_started_ ? 0x3u : 0x0u;
+                        emit_sysex_packet(sn, sysex_buf_count_, group, out);
+                    }
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    running_status_  = 0;
+                    data_count_      = 0;
+                }
+                else if (b == 0xF4 || b == 0xF5)
+                {
+                    // Undefined System Common: ignore, no state change.
+                }
+                else if (b >= 0xF1 && b <= 0xF6)
+                {
+                    // System Common: cancels running status and SysEx.
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    data_count_      = 0;
+                    const int dlen  = sys_common_data_len(b);
+                    if (dlen == 0)
+                    {
+                        emit_type1(b, 0, 0, group, out);
+                        running_status_ = 0;
+                    }
+                    else
+                    {
+                        running_status_ = b;
+                        data_needed_    = dlen;
+                    }
+                }
+                else
+                {
+                    // Channel status (0x80-0xEF): set/update running status.
+                    // Cancels in-progress SysEx per MIDI spec.
+                    in_sysex_        = false;
+                    sysex_started_   = false;
+                    sysex_buf_count_ = 0;
+                    running_status_  = b;
+                    data_needed_     = channel_data_len(b);
+                    data_count_      = 0;
+                }
+                continue;
+            }
+
+            // Data byte (0x00-0x7F)
+            if (in_sysex_)
+            {
+                // Flush a full 6-byte group immediately as start or continue.
+                if (sysex_buf_count_ == 6)
+                {
+                    emit_sysex_packet(sysex_started_ ? 0x2u : 0x1u, 6, group, out);
+                    sysex_started_   = true;
+                    sysex_buf_count_ = 0;
+                }
+                sysex_buf_[sysex_buf_count_++] = b;
+                continue;
+            }
+
+            if (running_status_ == 0)
+                continue;  // stray data byte - ignore
+
+            data_buf_[data_count_++] = b;
+            if (data_count_ >= data_needed_)
+            {
+                const uint8_t d1 = data_buf_[0];
+                const uint8_t d2 = (data_needed_ >= 2) ? data_buf_[1] : 0;
+                if (running_status_ < 0xF0)
+                    emit_type2(running_status_, d1, d2, group, out);
+                else
+                    emit_type1(running_status_, d1, d2, group, out);
+                data_count_ = 0;
+                // System common does not support running status.
+                if (running_status_ >= 0xF0)
+                    running_status_ = 0;
+            }
+        } // end byte loop
+
+        // Flush any pending partial SysEx bytes so that each send_buffer call
+        // produces output proportional to its input rather than accumulating
+        // silently until F7 arrives in a later chunk.
+        if (in_sysex_ && sysex_buf_count_ > 0)
+        {
+            emit_sysex_packet(sysex_started_ ? 0x2u : 0x1u,
+                              sysex_buf_count_, group, out);
+            sysex_started_   = true;
+            sysex_buf_count_ = 0;
+        }
+    }
+
+    //! Discard all accumulated state (call on port close / error recovery).
+    void reset()
+    {
+        in_sysex_        = false;
+        sysex_started_   = false;
+        sysex_buf_count_ = 0;
+        running_status_  = 0;
+        data_needed_     = 0;
+        data_count_      = 0;
+    }
+
+private:
+    static int channel_data_len(uint8_t status) noexcept
+    {
+        const uint8_t type = status >> 4;
+        return (type == 0xC || type == 0xD) ? 1 : 2;
+    }
+
+    static int sys_common_data_len(uint8_t status) noexcept
+    {
+        switch (status)
+        {
+        case 0xF1: return 1;  // MTC Quarter Frame
+        case 0xF2: return 2;  // Song Position Pointer
+        case 0xF3: return 1;  // Song Select
+        default:   return 0;  // 0xF4, 0xF5 (undefined), 0xF6 (Tune Request)
+        }
+    }
+
+    // Type-2: MIDI 1.0 Channel Voice (32-bit UMP)
+    static void emit_type2(uint8_t status, uint8_t d1, uint8_t d2,
+                            uint8_t group, std::vector<uint32_t>& out)
+    {
+        out.push_back((0x2u << 28)
+                    | (static_cast<uint32_t>(group)  << 24)
+                    | (static_cast<uint32_t>(status) << 16)
+                    | (static_cast<uint32_t>(d1)     <<  8)
+                    |  static_cast<uint32_t>(d2));
+    }
+
+    // Type-1: System Common / Realtime (32-bit UMP)
+    static void emit_type1(uint8_t status, uint8_t d1, uint8_t d2,
+                            uint8_t group, std::vector<uint32_t>& out)
+    {
+        out.push_back((0x1u << 28)
+                    | (static_cast<uint32_t>(group)  << 24)
+                    | (static_cast<uint32_t>(status) << 16)
+                    | (static_cast<uint32_t>(d1)     <<  8)
+                    |  static_cast<uint32_t>(d2));
+    }
+
+    // Type-3: SysEx Data (64-bit UMP pair).
+    // sn: 0x0=complete  0x1=start  0x2=continue  0x3=end
+    // count: number of valid payload bytes (0-6), read from sysex_buf_.
+    void emit_sysex_packet(uint8_t sn, int count, uint8_t group,
+                           std::vector<uint32_t>& out)
+    {
+        uint8_t b[6] = {};
+        for (int j = 0; j < count; ++j)
+            b[j] = sysex_buf_[j];
+        out.push_back((0x3u << 28)
+                    | (static_cast<uint32_t>(group) << 24)
+                    | (static_cast<uint32_t>(sn)    << 20)
+                    | (static_cast<uint32_t>(count) << 16)
+                    | (static_cast<uint32_t>(b[0])  <<  8)
+                    |  static_cast<uint32_t>(b[1]));
+        out.push_back((static_cast<uint32_t>(b[2]) << 24)
+                    | (static_cast<uint32_t>(b[3]) << 16)
+                    | (static_cast<uint32_t>(b[4]) <<  8)
+                    |  static_cast<uint32_t>(b[5]));
+    }
+
+    bool    in_sysex_        = false;
+    bool    sysex_started_   = false;  // emitted at least one start/continue packet
+    uint8_t sysex_buf_[6]    = {};     // pending SysEx bytes not yet emitted
+    int     sysex_buf_count_ = 0;      // 0-6
+    uint8_t running_status_  = 0;
+    int     data_needed_     = 0;
+    int     data_count_      = 0;
+    uint8_t data_buf_[2]     = {};
+};
+
+// Number of 32-bit words in the UMP whose first word is |word0|.
+static uint32_t ump_packet_words(uint32_t word0)
+{
+    static const uint8_t sizes[16] = { 1, 1, 1, 2, 2, 4, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4 };
+    return sizes[word0 >> 28];
+}
+
+static std::string wstring_to_utf8(const std::wstring_view wstr)
+{
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.data(),
+                                  static_cast<int>(wstr.size()),
+                                  nullptr, 0, nullptr, nullptr);
+    std::string out(len, '\0');
+    if (len)
+        WideCharToMultiByte(CP_UTF8, 0, wstr.data(),
+                            static_cast<int>(wstr.size()),
+                            out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+struct WinMidiPort
+{
+    std::string  display_name;    // UTF-8 for RtMidi consumers
+    std::wstring device_id;       // EndpointDeviceId for SDK calls
+    uint8_t      group_index = 0; // UMP group (0-15); maps to traditional port number
+};
+
+// Expands an endpoint's group terminal blocks into RtMidi input and output ports.
+static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
+                               std::vector<WinMidiPort>& in_ports,
+                               std::vector<WinMidiPort>& out_ports)
+{
+    std::string  ep_name   = wstring_to_utf8(static_cast<std::wstring_view>(ep.Name()));
+    std::wstring device_id = static_cast<std::wstring>(ep.EndpointDeviceId());
+
+    auto gtbs = ep.GetGroupTerminalBlocks();
+
+    if (gtbs.Size() == 0)
+    {
+        // No GTBs - single port at group 0, usable for both IN and OUT.
+        WinMidiPort p;
+        p.display_name = ep_name;
+        p.device_id    = device_id;
+        p.group_index  = 0;
+        in_ports.push_back(p);
+        out_ports.push_back(p);
+        return;
+    }
+
+    // Separate GTBs by direction.
+    //   BlockOutput (device->host) = RtMidi IN
+    //   BlockInput  (host->device) = RtMidi OUT
+    //   Bidirectional             = both
+    std::vector<MidiGroupTerminalBlock> in_gtbs, out_gtbs;
+    for (auto const& gtb : gtbs)
+    {
+        auto dir = gtb.Direction();
+        if (dir == MidiGroupTerminalBlockDirection::Bidirectional ||
+            dir == MidiGroupTerminalBlockDirection::BlockOutput)
+            in_gtbs.push_back(gtb);
+        if (dir == MidiGroupTerminalBlockDirection::Bidirectional ||
+            dir == MidiGroupTerminalBlockDirection::BlockInput)
+            out_gtbs.push_back(gtb);
+    }
+
+    // Sort + expand a GTB list into port entries.
+    auto expand = [&](std::vector<MidiGroupTerminalBlock>& matching, std::vector<WinMidiPort>& target)
+    {
+        if (matching.empty()) return;
+
+        std::sort(matching.begin(), matching.end(),
+            [](MidiGroupTerminalBlock const& a, MidiGroupTerminalBlock const& b) {
+                return a.FirstGroup().Index() < b.FirstGroup().Index();
+            });
+
+        uint8_t total_groups = 0;
+        for (auto const& gtb : matching) total_groups += gtb.GroupCount();
+
+        if (total_groups <= 1)
+        {
+            std::string gtb_name = wstring_to_utf8(
+                static_cast<std::wstring_view>(matching[0].Name()));
+            WinMidiPort p;
+            p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+            p.device_id    = device_id;
+            p.group_index  = matching[0].FirstGroup().Index();
+            target.push_back(std::move(p));
+        }
+        else
+        {
+            for (auto const& gtb : matching)
+            {
+                std::string gtb_name = wstring_to_utf8(
+                    static_cast<std::wstring_view>(gtb.Name()));
+                uint8_t first = gtb.FirstGroup().Index();
+                uint8_t count = gtb.GroupCount();
+                for (uint8_t g = 0; g < count; ++g)
+                {
+                    WinMidiPort p;
+                    p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+                    p.device_id    = device_id;
+                    p.group_index  = first + g;
+                    target.push_back(std::move(p));
+                }
+            }
+        }
+    };
+
+    expand(in_gtbs, in_ports);
+    expand(out_gtbs, out_ports);
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint list shared by all MidiInWinMidi2 / MidiOutWinMidi2 objects.
+//
+// One MidiEndpointDeviceWatcher keeps the port lists current as endpoints are
+// added, updated and removed, so getPortCount() never has to enumerate. The
+// first backend object starts it (initial enumeration takes about half a
+// second) and it keeps running, so later objects are created without that
+// delay. Its handlers are revoked during static destruction (process exit, or
+// unloading a DLL that links RtMidi); see ~WinMidiEndpointCache().
+// ---------------------------------------------------------------------------
+class WinMidiEndpointCache
+{
+public:
+    // Returns the running cache, starting it if needed, or nullptr if the
+    // Windows MIDI Services runtime is unavailable.
+    static std::shared_ptr<WinMidiEndpointCache> acquire();
+
+    ~WinMidiEndpointCache();
+
+    std::vector<WinMidiPort> ports(bool for_input) const;
+
+private:
+    struct Endpoint
+    {
+        std::wstring             device_id;
+        std::vector<WinMidiPort> in_ports;
+        std::vector<WinMidiPort> out_ports;
+    };
+
+    // Data written by the watcher callbacks. Each callback holds its own
+    // reference, so a callback still running while the watcher stops never
+    // touches freed memory.
+    struct State
+    {
+        std::mutex              mtx;
+        std::condition_variable enumerated_cv;
+        bool                    enumerated = false;
+        std::vector<Endpoint>   endpoints;
+
+        void set_endpoint(MidiEndpointDeviceInformation const& info, bool add_if_missing);
+        void remove_endpoint(std::wstring const& device_id);
+    };
+
+    WinMidiEndpointCache() = default;
+    bool start();
+    void revoke_handlers();
+
+    std::shared_ptr<State>    state_ = std::make_shared<State>();
+    MidiEndpointDeviceWatcher watcher_{ nullptr };
+    winrt::event_token        tok_added_{};
+    winrt::event_token        tok_updated_{};
+    winrt::event_token        tok_removed_{};
+    winrt::event_token        tok_enumerated_{};
+};
+
+std::shared_ptr<WinMidiEndpointCache> WinMidiEndpointCache::acquire()
+{
+    static std::mutex mtx;
+    static std::shared_ptr<WinMidiEndpointCache> instance;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (instance)
+        return instance;
+    if (!wms_runtime_available())
+        return nullptr;
+
+    std::shared_ptr<WinMidiEndpointCache> cache(new WinMidiEndpointCache());
+    if (!cache->start())
+        return nullptr;
+    instance = cache;
+    return cache;
+}
+
+// The cache is destroyed during static destruction, which for a DLL (including
+// rtmidi.dll itself) runs under the loader lock. Releasing the watcher there
+// is fatal: the system DeviceWatcher behind it calls CoDecrementMTAUsage(),
+// which fails fast under the loader lock. So only the handlers are revoked,
+// which keeps callbacks from reaching this code after it is unloaded, and the
+// watcher is deliberately leaked.
+WinMidiEndpointCache::~WinMidiEndpointCache()
+{
+    revoke_handlers();
+    if (watcher_)
+        static_cast<void>(winrt::detach_abi(watcher_));
+}
+
+bool WinMidiEndpointCache::start()
+{
+    try
+    {
+        watcher_ = MidiEndpointDeviceWatcher::Create(
+            MidiEndpointDeviceInformationFilters::StandardNativeMidi1ByteFormat
+            | MidiEndpointDeviceInformationFilters::StandardNativeUniversalMidiPacketFormat
+            | MidiEndpointDeviceInformationFilters::VirtualDeviceResponder);
+
+        std::shared_ptr<State> state = state_;
+
+        tok_added_ = watcher_.Added(
+            [state](MidiEndpointDeviceWatcher const&,
+                    MidiEndpointDeviceInformationAddedEventArgs const& args)
+            {
+                state->set_endpoint(args.AddedDevice(), true);
+            });
+
+        // An endpoint's name and group terminal blocks can change after it
+        // first appears, for example when UMP endpoint discovery completes.
+        tok_updated_ = watcher_.Updated(
+            [state](MidiEndpointDeviceWatcher const&,
+                    MidiEndpointDeviceInformationUpdatedEventArgs const& args)
+            {
+                auto info = MidiEndpointDeviceInformation::CreateFromEndpointDeviceId(
+                    args.EndpointDeviceId());
+                if (info)
+                    state->set_endpoint(info, false);
+            });
+
+        tok_removed_ = watcher_.Removed(
+            [state](MidiEndpointDeviceWatcher const&,
+                    MidiEndpointDeviceInformationRemovedEventArgs const& args)
+            {
+                state->remove_endpoint(static_cast<std::wstring>(args.EndpointDeviceId()));
+            });
+
+        tok_enumerated_ = watcher_.EnumerationCompleted(
+            [state](MidiEndpointDeviceWatcher const&,
+                    winrt::Windows::Foundation::IInspectable const&)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    state->enumerated = true;
+                }
+                state->enumerated_cv.notify_all();
+            });
+
+        watcher_.Start();
+    }
+    catch (winrt::hresult_error const&)
+    {
+        // Not under the loader lock here, so the watcher can be released.
+        revoke_handlers();
+        watcher_ = nullptr;
+        return false;
+    }
+
+    // Wait (at most 2 s) for the initial enumeration, so the first
+    // getPortCount() already sees the endpoints that are present.
+    std::unique_lock<std::mutex> lock(state_->mtx);
+    state_->enumerated_cv.wait_for(lock, std::chrono::seconds(2),
+                                   [this] { return state_->enumerated; });
+    return true;
+}
+
+void WinMidiEndpointCache::revoke_handlers()
+{
+    if (!watcher_)
+        return;
+    if (tok_added_)      watcher_.Added(tok_added_);
+    if (tok_updated_)    watcher_.Updated(tok_updated_);
+    if (tok_removed_)    watcher_.Removed(tok_removed_);
+    if (tok_enumerated_) watcher_.EnumerationCompleted(tok_enumerated_);
+    tok_added_ = tok_updated_ = tok_removed_ = tok_enumerated_ = {};
+}
+
+std::vector<WinMidiPort> WinMidiEndpointCache::ports(bool for_input) const
+{
+    std::vector<WinMidiPort> result;
+    std::lock_guard<std::mutex> lock(state_->mtx);
+    for (auto const& ep : state_->endpoints)
+    {
+        auto const& list = for_input ? ep.in_ports : ep.out_ports;
+        result.insert(result.end(), list.begin(), list.end());
+    }
+    return result;
+}
+
+void WinMidiEndpointCache::State::set_endpoint(
+    MidiEndpointDeviceInformation const& info, bool add_if_missing)
+{
+    Endpoint ep;
+    ep.device_id = static_cast<std::wstring>(info.EndpointDeviceId());
+    wms_parse_endpoint(info, ep.in_ports, ep.out_ports);
+
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = std::find_if(endpoints.begin(), endpoints.end(),
+        [&ep](Endpoint const& e) { return e.device_id == ep.device_id; });
+    if (it != endpoints.end())
+        *it = std::move(ep);
+    else if (add_if_missing)
+        endpoints.push_back(std::move(ep));
+}
+
+void WinMidiEndpointCache::State::remove_endpoint(std::wstring const& device_id)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    endpoints.erase(std::remove_if(endpoints.begin(), endpoints.end(),
+        [&device_id](Endpoint const& e) { return e.device_id == device_id; }),
+        endpoints.end());
+}
+
+// Revokes the receive handler and disconnects and closes the session.
+static void wms_disconnect(MidiSession session, MidiEndpointConnection connection,
+                           winrt::event_token token)
+{
+    try
+    {
+        if (connection && token)
+            connection.MessageReceived(token);
+        if (session && connection)
+            session.DisconnectEndpointConnection(connection.ConnectionId());
+        if (session)
+            session.Close();
+    }
+    catch (winrt::hresult_error const&)
+    {
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper class (analogous to UWPMidiClass)
+// ---------------------------------------------------------------------------
+class WinMidiServicesClass
+{
+public:
+    explicit WinMidiServicesClass(MidiApi& midi_api)
+        : midi_api_(midi_api)
+    {}
+
+    ~WinMidiServicesClass()
+    {
+        close();
+    }
+
+    // Attaches to the shared endpoint cache and loads the port list. Pass the
+    // input data for an input object and nullptr for an output object.
+    // Returns false if the Windows MIDI Services runtime is unavailable.
+    bool init(MidiInApi::RtMidiInData* input_data);
+    bool is_ready() const { return cache_ != nullptr; }
+
+    // Reloads the port list from the endpoint cache.
+    void refresh_ports();
+    size_t get_num_ports() const { return ports_.size(); }
+    std::string get_port_name(size_t n) const { return ports_[n].display_name; }
+
+    bool open(size_t port_number);
+    void close();
+
+    bool send_buffer(const unsigned char* buf, size_t len);
+
+    std::mutex mtx_open_close_;
+    std::mutex mtx_queue_;
+
+private:
+    // Lets close() stop message delivery safely. The receive handler holds its
+    // own reference, so a message arriving after close() finds receiver ==
+    // nullptr instead of a deleted object, and close() waits on mtx for a
+    // message that is being delivered. mtx is recursive so that a user
+    // callback can call closePort().
+    struct ReceiveGate
+    {
+        std::recursive_mutex  mtx;
+        WinMidiServicesClass* receiver = nullptr;
+    };
+
+    // UMP -> raw MIDI 1.0 bytes: fires RtMidi callback/queue
+    void midi_in_callback(MidiMessageReceivedEventArgs const& args);
+
+    MidiApi& midi_api_;
+
+    MidiInApi::RtMidiInData* input_data_{ nullptr };
+
+    std::shared_ptr<WinMidiEndpointCache> cache_;
+    std::vector<WinMidiPort> ports_;
+
+    // Per-connection state (populated when openPort is called)
+    MidiSession                  session_{ nullptr };
+    MidiEndpointConnection       connection_{ nullptr };
+    winrt::event_token           msg_token_{};
+    std::shared_ptr<ReceiveGate> gate_;
+    std::atomic<DWORD>           callback_thread_{ 0 };  // thread inside the user callback
+#ifdef RTMIDI_USE_WMS_COM_RAW
+    winrt::com_ptr<IMidiEndpointConnectionRaw> raw_;  // QI'd after connection_.Open()
+#endif
+
+    // Active UMP group for the open port
+    uint8_t active_group_{ 0 };
+
+    // Max UMP words per SendMultipleMessages* call - queried from the SDK
+    // after Open() via GetSupportedMaxMidiWordsPerTransmission().
+    uint32_t max_words_per_call_{ 684u };
+
+    // Stateful MIDI 1.0 -> UMP encoder (persists running status and SysEx
+    // framing across send_buffer calls).
+    Midi1UmpEncoder encoder_;
+
+    // Input timestamps, in MidiClock ticks
+    uint64_t timestamp_frequency_{ 10000000u };
+    uint64_t last_timestamp_{ 0 };
+    bool first_message_{ true };
+
+    // SysEx 7 reassembly buffer: accumulates Start/Continue fragments
+    // until the End packet arrives, then dispatches a single complete message.
+    std::vector<uint8_t> sysex_buf_;
+};
+
+// ---------------------------------------------------------------------------
+bool WinMidiServicesClass::init(MidiInApi::RtMidiInData* input_data)
+{
+    input_data_ = input_data;
+    if (!cache_)
+        cache_ = WinMidiEndpointCache::acquire();
+    if (!cache_)
+        return false;
+    refresh_ports();
+    return true;
+}
+
+void WinMidiServicesClass::refresh_ports()
+{
+    if (cache_)
+        ports_ = cache_->ports(input_data_ != nullptr);
+}
+
+// ---------------------------------------------------------------------------
+bool WinMidiServicesClass::open(size_t port_number)
+{
+    if (!cache_ || port_number >= ports_.size()) return false;
+
+    active_group_       = ports_[port_number].group_index;
+    max_words_per_call_ = 684u;
+    first_message_      = true;
+
+    try
+    {
+        session_ = MidiSession::Create(L"RtMidi");
+        if (session_)
+            connection_ = session_.CreateEndpointConnection(
+                winrt::hstring(ports_[port_number].device_id));
+        if (!connection_)
+        {
+            close();
+            return false;
+        }
+
+        if (input_data_)
+        {
+            timestamp_frequency_ = MidiClock::TimestampFrequency();
+            if (timestamp_frequency_ == 0)
+                timestamp_frequency_ = 10000000u;
+
+            gate_ = std::make_shared<ReceiveGate>();
+            gate_->receiver = this;
+            std::shared_ptr<ReceiveGate> gate = gate_;
+            msg_token_ = connection_.MessageReceived(
+                [gate](IMidiMessageReceivedEventSource const&,
+                       MidiMessageReceivedEventArgs const& args)
+                {
+                    std::lock_guard<std::recursive_mutex> lock(gate->mtx);
+                    if (gate->receiver)
+                        gate->receiver->midi_in_callback(args);
+                });
+        }
+
+        if (!connection_.Open())
+        {
+            close();
+            return false;
+        }
+
+        if (!input_data_)
+        {
+            // Ask the service how many UMP words one send may carry; the SDK
+            // documents this as liable to change, so it is not hardcoded. If the
+            // installed runtime predates the method, keep the default of 684
+            // (MAXIMUM_LOOPED_UMP_DATASIZE / sizeof(uint32_t) == 2736 / 4).
+            try
+            {
+                const uint32_t words = connection_.GetSupportedMaxMidiWordsPerTransmission();
+                if (words > 0) max_words_per_call_ = words;
+            }
+            catch (winrt::hresult_error const&)
+            {
+            }
+
+#ifdef RTMIDI_USE_WMS_COM_RAW
+            // QI the COM extension interface for zero-allocation sends
+            raw_ = connection_.as<IMidiEndpointConnectionRaw>();
+#endif
+        }
+    }
+    catch (winrt::hresult_error const& ex)
+    {
+        close();
+        std::ostringstream ss;
+        ss << "WinMidiServicesClass::open: HRESULT 0x"
+           << std::hex << static_cast<uint32_t>(ex.code()) << " "
+           << wstring_to_utf8(static_cast<std::wstring_view>(ex.message()));
+        midi_api_.error(RtMidiError::DRIVER_ERROR, ss.str());
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Also releases whatever a failed open() left behind.
+//
+// closePort() may be called from the input callback, or from another thread,
+// but not from both at the same time.
+void WinMidiServicesClass::close()
+{
+    if (gate_)
+    {
+        // Waits for a message being delivered on another thread, then stops
+        // delivery. The mutex is recursive, so a call from the callback itself
+        // does not block here.
+        std::lock_guard<std::recursive_mutex> lock(gate_->mtx);
+        gate_->receiver = nullptr;
+    }
+
+    if (callback_thread_ == GetCurrentThreadId())
+    {
+        // Called from the user callback. Disconnecting waits for the SDK's
+        // receive thread to exit, and that is the thread running the callback,
+        // so the teardown runs on another thread and finishes once the
+        // callback returns.
+        try
+        {
+            std::thread(wms_disconnect, std::move(session_), std::move(connection_), msg_token_).detach();
+        }
+        catch (std::system_error const&)
+        {
+        }
+    }
+    else
+    {
+        wms_disconnect(session_, connection_, msg_token_);
+    }
+
+    msg_token_ = {};
+#ifdef RTMIDI_USE_WMS_COM_RAW
+    raw_ = nullptr;
+#endif
+    connection_ = nullptr;
+    session_    = nullptr;
+    gate_.reset();
+    encoder_.reset();
+    sysex_buf_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Receive callback: convert UMP back to raw MIDI 1.0 bytes
+// ---------------------------------------------------------------------------
+void WinMidiServicesClass::midi_in_callback(MidiMessageReceivedEventArgs const& args)
+{
+    if (!input_data_) return;
+
+    uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    args.FillWords(w0, w1, w2, w3);
+
+    const uint8_t message_type = static_cast<uint8_t>(w0 >> 28);
+
+    // Filter to the group this port was opened on.
+    if (static_cast<uint8_t>((w0 >> 24) & 0x0F) != active_group_) return;
+
+    MidiInApi::MidiMessage message;
+
+    if (message_type == 0x1 || message_type == 0x2)
+    {
+        // Type 1: system common / real-time. Type 2: MIDI 1.0 channel voice.
+        const uint8_t status = static_cast<uint8_t>((w0 >> 16) & 0xFF);
+        size_t byte_count;
+        if (message_type == 0x1)
+        {
+            if (status < 0xF1 || status == 0xF7) return;
+            if (status == 0xF2)
+                byte_count = 3;
+            else if (status == 0xF1 || status == 0xF3)
+                byte_count = 2;
+            else
+                byte_count = 1;
+        }
+        else
+        {
+            if (status < 0x80 || status > 0xEF) return;
+            const uint8_t st = status & 0xF0;
+            byte_count = (st == 0xC0 || st == 0xD0) ? 2 : 3;
+        }
+
+        if ((input_data_->ignoreFlags & 0x02) && (status == 0xF1 || status == 0xF8))
+            return;
+        if ((input_data_->ignoreFlags & 0x04) && status == 0xFE)
+            return;
+
+        message.bytes.push_back(status);
+        if (byte_count >= 2) message.bytes.push_back(static_cast<uint8_t>((w0 >> 8) & 0xFF));
+        if (byte_count >= 3) message.bytes.push_back(static_cast<uint8_t>(w0 & 0xFF));
+    }
+    else if (message_type == 0x3)
+    {
+        // Type 3: SysEx 7-bit, one 64-bit packet per fragment
+        if (input_data_->ignoreFlags & 0x01)
+        {
+            sysex_buf_.clear();
+            return;
+        }
+
+        const uint8_t status_nibble = static_cast<uint8_t>((w0 >> 20) & 0x0F);
+        uint8_t n = static_cast<uint8_t>((w0 >> 16) & 0x0F);
+        if (n > 6) n = 6;
+
+        // Reconstruct raw bytes from the two words (big-endian payload)
+        const uint8_t payload[6] = {
+            static_cast<uint8_t>((w0 >>  8) & 0xFF),
+            static_cast<uint8_t>((w0 >>  0) & 0xFF),
+            static_cast<uint8_t>((w1 >> 24) & 0xFF),
+            static_cast<uint8_t>((w1 >> 16) & 0xFF),
+            static_cast<uint8_t>((w1 >>  8) & 0xFF),
+            static_cast<uint8_t>((w1 >>  0) & 0xFF),
+        };
+
+        if (status_nibble == 0x0)
+        {
+            // Complete single-packet SysEx - dispatch immediately.
+            message.bytes.push_back(0xF0);
+            message.bytes.insert(message.bytes.end(), payload, payload + n);
+            message.bytes.push_back(0xF7);
+        }
+        else if (status_nibble == 0x1)
+        {
+            // Start - begin accumulation; do not dispatch yet.
+            sysex_buf_.clear();
+            sysex_buf_.push_back(0xF0);
+            sysex_buf_.insert(sysex_buf_.end(), payload, payload + n);
+            return;
+        }
+        else if (status_nibble == 0x2)
+        {
+            // Continue - append to accumulation buffer; do not dispatch yet.
+            if (sysex_buf_.empty()) return; // orphaned continue, discard
+            sysex_buf_.insert(sysex_buf_.end(), payload, payload + n);
+            return;
+        }
+        else if (status_nibble == 0x3)
+        {
+            // End - append final bytes, close with F7, then dispatch.
+            if (sysex_buf_.empty()) return; // orphaned end, discard
+            sysex_buf_.insert(sysex_buf_.end(), payload, payload + n);
+            sysex_buf_.push_back(0xF7);
+            message.bytes = std::move(sysex_buf_);
+            sysex_buf_.clear();
+        }
+        else
+        {
+            return; // unknown status nibble
+        }
+    }
+    else
+    {
+        // Utility (type 0), MIDI 2.0 channel voice (type 4) and the other UMP
+        // message types have no MIDI 1.0 byte form; they are not delivered.
+        return;
+    }
+
+    // Timestamp: delta since the previous delivered message, in seconds
+    const uint64_t ts = args.Timestamp();
+    if (first_message_)
+    {
+        message.timeStamp = 0.0;
+        first_message_ = false;
+    }
+    else
+    {
+        const uint64_t delta = (ts > last_timestamp_) ? (ts - last_timestamp_) : 0;
+        message.timeStamp = static_cast<double>(delta) / static_cast<double>(timestamp_frequency_);
+    }
+    last_timestamp_ = ts;
+
+    if (input_data_->usingCallback)
+    {
+        // Lets close() recognize a closePort() made from inside the callback.
+        struct CallbackScope
+        {
+            std::atomic<DWORD>& thread;
+            ~CallbackScope() { thread = 0; }
+        } scope{ callback_thread_ };
+        callback_thread_ = GetCurrentThreadId();
+
+        (input_data_->userCallback)(message.timeStamp, &message.bytes,
+                                    input_data_->userData);
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lock(mtx_queue_);
+        if (!input_data_->queue.push(message))
+            std::cerr << "\nMidiInWinMidi2: message queue limit reached!!\n\n";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Send: convert raw MIDI 1.0 bytes to UMP and transmit
+// ---------------------------------------------------------------------------
+bool WinMidiServicesClass::send_buffer(const unsigned char* buf, size_t len)
+{
+    if (!connection_ || len == 0) return false;
+
+    try
+    {
+        // Encode with a copy of the encoder and keep its state only once every
+        // word is sent, so a caller retrying a failed message starts from the
+        // same running status and SysEx framing.
+        Midi1UmpEncoder encoder = encoder_;
+        std::vector<uint32_t> words;
+        encoder.encode(buf, len, active_group_, words);
+
+        const uint32_t total = static_cast<uint32_t>(words.size());
+        uint32_t offset = 0;
+        while (offset < total)
+        {
+            // Fill each batch with whole packets only: the service rejects a
+            // send that ends partway through a multi-word packet.
+            uint32_t batch = 0;
+            while (offset + batch < total)
+            {
+                const uint32_t size = ump_packet_words(words[offset + batch]);
+                if (batch > 0 && batch + size > max_words_per_call_)
+                    break;
+                batch += size;
+            }
+            if (batch > total - offset)
+                batch = total - offset;
+
+#ifdef RTMIDI_USE_WMS_COM_RAW
+            // Zero-allocation COM path: pointer straight into our local vector.
+            HRESULT hr = raw_->SendMidiMessagesRaw(
+                0,
+                batch,
+                words.data() + offset);
+
+            if (FAILED(hr))
+            {
+                std::ostringstream ss;
+                ss << "WinMidiServicesClass::send_buffer: SendMidiMessagesRaw failed"
+                   << " at word offset " << offset << " (batch " << batch << " words)"
+                   << " HRESULT 0x" << std::hex << static_cast<uint32_t>(hr);
+                midi_api_.error(RtMidiError::DRIVER_ERROR, ss.str());
+                return false;
+            }
+#else
+            auto result = connection_.SendMultipleMessagesWordArray(
+                0,
+                offset,
+                batch,
+                winrt::array_view<uint32_t const>(words.data(), words.data() + total));
+
+            if (!MidiEndpointConnection::SendMessageSucceeded(result))
+            {
+                std::ostringstream ss;
+                ss << "WinMidiServicesClass::send_buffer: SendMultipleMessagesWordArray failed"
+                   << " at word offset " << offset << " (batch " << batch << " words)";
+                midi_api_.error(RtMidiError::DRIVER_ERROR, ss.str());
+                return false;
+            }
+#endif
+            offset += batch;
+        }
+
+        encoder_ = encoder;
+        return true;
+    }
+    catch (winrt::hresult_error const& ex)
+    {
+        std::ostringstream ss;
+        ss << "WinMidiServicesClass::send_buffer: HRESULT 0x"
+           << std::hex << static_cast<uint32_t>(ex.code()) << " "
+           << wstring_to_utf8(static_cast<std::wstring_view>(ex.message()));
+        midi_api_.error(RtMidiError::DRIVER_ERROR, ss.str());
+        return false;
+    }
+}
+
+//*********************************************************************//
+//  API: Windows MIDI Services - MidiInWinMidi2
+//*********************************************************************//
+
+MidiInWinMidi2::MidiInWinMidi2(const std::string& clientName, unsigned int queueSizeLimit)
+    : MidiInApi(queueSizeLimit)
+{
+    MidiInWinMidi2::initialize(clientName);
+}
+
+MidiInWinMidi2::~MidiInWinMidi2()
+{
+    MidiInWinMidi2::closePort();
+    delete static_cast<WinMidiServicesClass*>(apiData_);
+}
+
+void MidiInWinMidi2::initialize(const std::string& /*clientName*/)
+{
+    WinMidiServicesClass* data = new WinMidiServicesClass(*this);
+    apiData_ = static_cast<void*>(data);
+
+    if (!data->init(&inputData_))
+    {
+        // Only a debug warning: an UNSPECIFIED API search constructs this
+        // backend on systems without the runtime. openPort() reports it.
+        errorString_ = "MidiInWinMidi2::initialize: Windows MIDI Services is not available.";
+        error(RtMidiError::DEBUG_WARNING, errorString_);
+        return;
+    }
+
+    if (data->get_num_ports() == 0)
+    {
+        errorString_ = "MidiInWinMidi2::initialize: no MIDI input devices currently available.";
+        error(RtMidiError::WARNING, errorString_);
+    }
+}
+
+void MidiInWinMidi2::openPort(unsigned int portNumber, const std::string& /*portName*/)
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    std::lock_guard<std::mutex> lock(data->mtx_open_close_);
+
+    if (connected_)
+    {
+        errorString_ = "MidiInWinMidi2::openPort: a valid connection already exists!";
+        error(RtMidiError::WARNING, errorString_);
+        return;
+    }
+
+    if (!data->is_ready() && !data->init(&inputData_))
+    {
+        errorString_ = std::string("MidiInWinMidi2::openPort: the Windows MIDI Services runtime is not "
+                                   "installed or the MIDI service is not running (") + kWmsRuntimeInstallUrl + ").";
+        error(RtMidiError::DRIVER_NOT_INSTALLED, errorString_);
+        return;
+    }
+
+    // Refresh the port list from the live watcher cache.  This instance may have
+    // been created before the target device appeared (e.g. midi_in is recreated
+    // on Windows when a port closes, but the bootloader shows up 700ms later).
+    data->refresh_ports();
+
+    if (data->get_num_ports() == 0)
+    {
+        errorString_ = "MidiInWinMidi2::openPort: no MIDI input sources found!";
+        error(RtMidiError::NO_DEVICES_FOUND, errorString_);
+        return;
+    }
+    if (portNumber >= data->get_num_ports())
+    {
+        std::ostringstream ost;
+        ost << "MidiInWinMidi2::openPort: portNumber (" << portNumber
+            << ") is invalid (cache has " << data->get_num_ports() << " ports).";
+        errorString_ = ost.str();
+        error(RtMidiError::INVALID_PARAMETER, errorString_);
+        return;
+    }
+    if (!data->open(portNumber))
+    {
+        errorString_ = "MidiInWinMidi2::openPort: error opening Windows MIDI Services input port.";
+        error(RtMidiError::DRIVER_ERROR, errorString_);
+        return;
+    }
+    connected_ = true;
+}
+
+void MidiInWinMidi2::openVirtualPort(const std::string& /*portName*/)
+{
+    errorString_ = "MidiInWinMidi2::openVirtualPort: not supported by Windows MIDI Services.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+void MidiInWinMidi2::closePort()
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    std::lock_guard<std::mutex> lock(data->mtx_open_close_);
+    if (connected_)
+    {
+        data->close();
+        connected_ = false;
+    }
+}
+
+void MidiInWinMidi2::setClientName(const std::string&)
+{
+    errorString_ = "MidiInWinMidi2::setClientName: not implemented for WINDOWS_MIDI_SERVICES.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+void MidiInWinMidi2::setPortName(const std::string&)
+{
+    errorString_ = "MidiInWinMidi2::setPortName: not implemented for WINDOWS_MIDI_SERVICES.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+unsigned int MidiInWinMidi2::getPortCount()
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    // Re-read the watcher cache on every call when no port is open, so hot-plug
+    // events (e.g. device rebooting into bootloader) are visible - matching the
+    // live-query behaviour of the WinMM backend.
+    if (!connected_)
+        data->refresh_ports();
+    return static_cast<unsigned int>(data->get_num_ports());
+}
+
+std::string MidiInWinMidi2::getPortName(unsigned int portNumber)
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    if (portNumber >= data->get_num_ports())
+    {
+        std::ostringstream ost;
+        ost << "MidiInWinMidi2::getPortName: portNumber (" << portNumber << ") is invalid.";
+        errorString_ = ost.str();
+        error(RtMidiError::WARNING, errorString_);
+        return "";
+    }
+    return data->get_port_name(portNumber);
+}
+
+double MidiInWinMidi2::getMessage(std::vector<unsigned char>* message)
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    std::lock_guard<std::mutex> lock(data->mtx_queue_);
+    return MidiInApi::getMessage(message);
+}
+
+//*********************************************************************//
+//  API: Windows MIDI Services - MidiOutWinMidi2
+//*********************************************************************//
+
+MidiOutWinMidi2::MidiOutWinMidi2(const std::string& clientName) : MidiOutApi()
+{
+    MidiOutWinMidi2::initialize(clientName);
+}
+
+MidiOutWinMidi2::~MidiOutWinMidi2()
+{
+    MidiOutWinMidi2::closePort();
+    delete static_cast<WinMidiServicesClass*>(apiData_);
+}
+
+void MidiOutWinMidi2::initialize(const std::string& /*clientName*/)
+{
+    WinMidiServicesClass* data = new WinMidiServicesClass(*this);
+    apiData_ = static_cast<void*>(data);
+
+    if (!data->init(nullptr))
+    {
+        // Only a debug warning: an UNSPECIFIED API search constructs this
+        // backend on systems without the runtime. openPort() reports it.
+        errorString_ = "MidiOutWinMidi2::initialize: Windows MIDI Services is not available.";
+        error(RtMidiError::DEBUG_WARNING, errorString_);
+        return;
+    }
+
+    if (data->get_num_ports() == 0)
+    {
+        errorString_ = "MidiOutWinMidi2::initialize: no MIDI output devices currently available.";
+        error(RtMidiError::WARNING, errorString_);
+    }
+}
+
+unsigned int MidiOutWinMidi2::getPortCount()
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    // Re-read the watcher cache on every call when no port is open - matches WinMM behaviour.
+    if (!connected_)
+        data->refresh_ports();
+    return static_cast<unsigned int>(data->get_num_ports());
+}
+
+std::string MidiOutWinMidi2::getPortName(unsigned int portNumber)
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    if (portNumber >= data->get_num_ports())
+    {
+        std::ostringstream ost;
+        ost << "MidiOutWinMidi2::getPortName: portNumber (" << portNumber << ") is invalid.";
+        errorString_ = ost.str();
+        error(RtMidiError::WARNING, errorString_);
+        return "";
+    }
+    return data->get_port_name(portNumber);
+}
+
+void MidiOutWinMidi2::openPort(unsigned int portNumber, const std::string& /*portName*/)
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    std::lock_guard<std::mutex> lock(data->mtx_open_close_);
+
+    if (connected_)
+    {
+        errorString_ = "MidiOutWinMidi2::openPort: a valid connection already exists!";
+        error(RtMidiError::WARNING, errorString_);
+        return;
+    }
+
+    if (!data->is_ready() && !data->init(nullptr))
+    {
+        errorString_ = std::string("MidiOutWinMidi2::openPort: the Windows MIDI Services runtime is not "
+                                   "installed or the MIDI service is not running (") + kWmsRuntimeInstallUrl + ").";
+        error(RtMidiError::DRIVER_NOT_INSTALLED, errorString_);
+        return;
+    }
+
+    // Refresh the port list from the live watcher cache (same reason as MidiInWinMidi2).
+    data->refresh_ports();
+
+    if (data->get_num_ports() == 0)
+    {
+        errorString_ = "MidiOutWinMidi2::openPort: no MIDI output destinations found!";
+        error(RtMidiError::NO_DEVICES_FOUND, errorString_);
+        return;
+    }
+    if (portNumber >= data->get_num_ports())
+    {
+        std::ostringstream ost;
+        ost << "MidiOutWinMidi2::openPort: portNumber (" << portNumber
+            << ") is invalid (cache has " << data->get_num_ports() << " ports).";
+        errorString_ = ost.str();
+        error(RtMidiError::INVALID_PARAMETER, errorString_);
+        return;
+    }
+    if (!data->open(portNumber))
+    {
+        errorString_ = "MidiOutWinMidi2::openPort: error opening Windows MIDI Services output port.";
+        error(RtMidiError::DRIVER_ERROR, errorString_);
+        return;
+    }
+    connected_ = true;
+}
+
+void MidiOutWinMidi2::closePort()
+{
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    std::lock_guard<std::mutex> lock(data->mtx_open_close_);
+    if (connected_)
+    {
+        data->close();
+        connected_ = false;
+    }
+}
+
+void MidiOutWinMidi2::openVirtualPort(const std::string& /*portName*/)
+{
+    errorString_ = "MidiOutWinMidi2::openVirtualPort: not supported by Windows MIDI Services.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+void MidiOutWinMidi2::setClientName(const std::string&)
+{
+    errorString_ = "MidiOutWinMidi2::setClientName: not implemented for WINDOWS_MIDI_SERVICES.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+void MidiOutWinMidi2::setPortName(const std::string&)
+{
+    errorString_ = "MidiOutWinMidi2::setPortName: not implemented for WINDOWS_MIDI_SERVICES.";
+    error(RtMidiError::WARNING, errorString_);
+}
+
+void MidiOutWinMidi2::sendMessage(const unsigned char* message, size_t size)
+{
+    if (!connected_) return;
+    if (size == 0)
+    {
+        errorString_ = "MidiOutWinMidi2::sendMessage: message is empty!";
+        error(RtMidiError::WARNING, errorString_);
+        return;
+    }
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(apiData_);
+    if (!data->send_buffer(message, size))
+    {
+        errorString_ = "MidiOutWinMidi2::sendMessage: error sending message.";
+        error(RtMidiError::DRIVER_ERROR, errorString_);
+        return;
+    }
+    // NOTE: send_buffer() (SendMidiMessagesRaw/SendMultipleMessagesWordArray)
+    // returns once WMS accepts the message, NOT once it is actually on the
+    // wire - unlike MidiOutWinMM::sendMessage, which blocks until the driver
+    // has finished with the buffer. So this backend gives a caller pacing a
+    // chunked transfer no real backpressure signal - only whatever gap the
+    // caller adds itself. Whether that matters in practice depends on the WMS
+    // transport's own internal pacing, which has not been characterized here.
+}
+
+// ---------------------------------------------------------------------------
+// RtMidi::checkApiAvailability - WMS implementation
+// ---------------------------------------------------------------------------
+RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
+{
+    RtMidiApiAvailability result;
+    if ( api != RtMidi::WINDOWS_MIDI_SERVICES )
+        return result;  // available = true (default) for all other APIs
+
+    if ( !wms_runtime_available() ) {
+        result.available  = false;
+        result.message    = "The Windows MIDI Services SDK runtime is not installed, or the MIDI service is not running.";
+        result.installUrl = kWmsRuntimeInstallUrl;
+    }
+    return result;
+}
+
+#endif  // __WINDOWS_MIDI_SERVICES__
+
+// Without the Windows MIDI Services backend, no compiled API depends on a
+// runtime that can be missing, so only WMS itself is reported as unavailable.
+#if !defined(__WINDOWS_MIDI_SERVICES__)
+RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
+{
+    RtMidiApiAvailability result;
+    if ( api == RtMidi::WINDOWS_MIDI_SERVICES ) {
+        result.available = false;
+        result.message   = "This build does not include the Windows MIDI Services backend.";
+    }
+    return result;
+}
+#endif  // !__WINDOWS_MIDI_SERVICES__
 
 
 //*********************************************************************//
