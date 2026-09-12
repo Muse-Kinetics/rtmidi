@@ -2747,7 +2747,19 @@ struct WinMidiData {
   MidiInApi::MidiMessage message;
   std::vector<LPMIDIHDR> sysexBuffer;
   CRITICAL_SECTION _mutex; // [Patrice] see https://groups.google.com/forum/#!topic/mididev/6OUjHutMpEo
+  // Output-side SysEx framing state: true once 0xF0 has been sent and no 0xF7
+  // (or other terminating status byte) has been seen yet. Lets sendMessage()
+  // route a continuation span to midiOutLongMsg() regardless of its length.
+  bool sysexInProgress = false;
+  // Input-side teardown flag, guarded by _mutex: set while the sysex buffers
+  // are being retired so midiInputCallback() stops requeueing them.
+  bool inputClosing = false;
 };
+
+// How long to wait for a driver to release a buffer (or to close a port that
+// still has buffers queued) before giving up. Deliberately generous: this
+// guards against a driver that never lets go, it is not a tuning value.
+static const DWORD kWinMMBufferReleaseTimeoutMs = 5000;
 
 //*********************************************************************//
 //  API: Windows MM
@@ -2819,10 +2831,16 @@ static void CALLBACK midiInputCallback( HMIDIIN /*hmin*/,
     // buffer when an application closes and in this case, we should
     // avoid requeueing it, else the computer suddenly reboots after
     // one or two minutes.
-    if ( apiData->sysexBuffer[sysex->dwUser]->dwBytesRecorded > 0 ) {
-      //if ( sysex->dwBytesRecorded > 0 ) {
+    //
+    // Use the header WinMM handed back rather than indexing sysexBuffer: it is
+    // the same object, and the vector is cleared once the port has closed. Do
+    // not requeue while the port is closing, since the buffers are about to be
+    // unprepared and freed.
+    if ( sysex->dwBytesRecorded > 0 ) {
+      MMRESULT result = MMSYSERR_NOERROR;
       EnterCriticalSection( &(apiData->_mutex) );
-      MMRESULT result = midiInAddBuffer( apiData->inHandle, apiData->sysexBuffer[sysex->dwUser], sizeof(MIDIHDR) );
+      if ( !apiData->inputClosing )
+        result = midiInAddBuffer( apiData->inHandle, sysex, sizeof(MIDIHDR) );
       LeaveCriticalSection( &(apiData->_mutex) );
       if ( result != MMSYSERR_NOERROR )
         std::cerr << "\nRtMidiIn::midiInputCallback: error sending sysex to Midi device!!\n\n";
@@ -2847,6 +2865,52 @@ static void CALLBACK midiInputCallback( HMIDIIN /*hmin*/,
 
   // Clear the vector for the next input message.
   apiData->message.bytes.clear();
+}
+
+// Stop input and release everything MidiInWinMM::openPort() acquired: the
+// sysex buffers and the input handle. Used by closePort() and by openPort()'s
+// own failure paths, so it has to cope with a partly built buffer list.
+//
+// Every step runs regardless of earlier failures and nothing here throws or
+// returns early, so the port can never be left half torn down (see #376).
+// Returns the first failure, or MMSYSERR_NOERROR.
+static MMRESULT releaseWinMMInput( WinMidiData *data )
+{
+  // Stop the callback requeueing buffers before retiring them. The flag is
+  // set under the lock, but the lock is not held across midiInReset(), which
+  // drives the very callbacks that take it.
+  EnterCriticalSection( &(data->_mutex) );
+  data->inputClosing = true;
+  LeaveCriticalSection( &(data->_mutex) );
+
+  midiInReset( data->inHandle );
+  midiInStop( data->inHandle );
+
+  MMRESULT firstFailure = MMSYSERR_NOERROR;
+  for ( size_t i=0; i < data->sysexBuffer.size(); ++i ) {
+    if ( data->sysexBuffer[i] == NULL ) continue;
+    MMRESULT result = midiInUnprepareHeader( data->inHandle, data->sysexBuffer[i], sizeof(MIDIHDR) );
+    if ( result != MMSYSERR_NOERROR ) {
+      // The driver may still own this header, so leak it rather than free it.
+      if ( firstFailure == MMSYSERR_NOERROR ) firstFailure = result;
+      data->sysexBuffer[i] = NULL;
+    }
+  }
+
+  MMRESULT result = midiInClose( data->inHandle );
+  if ( result != MMSYSERR_NOERROR && firstFailure == MMSYSERR_NOERROR ) firstFailure = result;
+  data->inHandle = 0;
+
+  // No callbacks arrive once the handle is closed, so the headers can go now.
+  for ( size_t i=0; i < data->sysexBuffer.size(); ++i ) {
+    if ( data->sysexBuffer[i] == NULL ) continue;
+    delete [] data->sysexBuffer[i]->lpData;
+    delete data->sysexBuffer[i];
+  }
+  data->sysexBuffer.clear();
+  data->inputClosing = false;
+
+  return firstFailure;
 }
 
 MidiInWinMM :: MidiInWinMM( const std::string &clientName, unsigned int queueSizeLimit )
@@ -2927,7 +2991,7 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
   // Allocate and init the sysex buffers.
   data->sysexBuffer.resize( inputData_.bufferCount );
   for ( unsigned int i=0; i < inputData_.bufferCount; ++i ) {
-    data->sysexBuffer[i] = (MIDIHDR*) new char[ sizeof(MIDIHDR) ];
+    data->sysexBuffer[i] = new MIDIHDR();
     data->sysexBuffer[i]->lpData = new char[ inputData_.bufferSize ];
     data->sysexBuffer[i]->dwBufferLength = inputData_.bufferSize;
     data->sysexBuffer[i]->dwUser = i; // We use the dwUser parameter as buffer indicator
@@ -2935,8 +2999,7 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
 
     result = midiInPrepareHeader( data->inHandle, data->sysexBuffer[i], sizeof(MIDIHDR) );
     if ( result != MMSYSERR_NOERROR ) {
-      midiInClose( data->inHandle );
-      data->inHandle = 0;
+      releaseWinMMInput( data );
       errorString_ = "MidiInWinMM::openPort: error starting Windows MM MIDI input port (PrepareHeader).";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
       return;
@@ -2945,8 +3008,7 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
     // Register the buffer.
     result = midiInAddBuffer( data->inHandle, data->sysexBuffer[i], sizeof(MIDIHDR) );
     if ( result != MMSYSERR_NOERROR ) {
-      midiInClose( data->inHandle );
-      data->inHandle = 0;
+      releaseWinMMInput( data );
       errorString_ = "MidiInWinMM::openPort: error starting Windows MM MIDI input port (AddBuffer).";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
       return;
@@ -2955,8 +3017,7 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
 
   result = midiInStart( data->inHandle );
   if ( result != MMSYSERR_NOERROR ) {
-    midiInClose( data->inHandle );
-    data->inHandle = 0;
+    releaseWinMMInput( data );
     errorString_ = "MidiInWinMM::openPort: error starting Windows MM MIDI input port.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -2976,27 +3037,18 @@ void MidiInWinMM :: closePort( void )
 {
   if ( connected_ ) {
     WinMidiData *data = static_cast<WinMidiData *> (apiData_);
-    EnterCriticalSection( &(data->_mutex) );
-    midiInReset( data->inHandle );
-    midiInStop( data->inHandle );
-
-    for ( size_t i=0; i < data->sysexBuffer.size(); ++i ) {
-      int result = midiInUnprepareHeader(data->inHandle, data->sysexBuffer[i], sizeof(MIDIHDR));
-      delete [] data->sysexBuffer[i]->lpData;
-      delete [] data->sysexBuffer[i];
-      if ( result != MMSYSERR_NOERROR ) {
-        midiInClose( data->inHandle );
-        data->inHandle = 0;
-        errorString_ = "MidiInWinMM::openPort: error closing Windows MM MIDI input port (midiInUnprepareHeader).";
-        error( RtMidiError::DRIVER_ERROR, errorString_ );
-        return;
-      }
-    }
-
-    midiInClose( data->inHandle );
-    data->inHandle = 0;
+    MMRESULT result = releaseWinMMInput( data );
     connected_ = false;
-    LeaveCriticalSection( &(data->_mutex) );
+
+    // Reported only once the port is fully closed, and as a warning rather
+    // than an error: nothing is left for the caller to act on, and
+    // closePort() also runs from the destructor, where a thrown RtMidiError
+    // would terminate the process.
+    if ( result != MMSYSERR_NOERROR ) {
+      errorString_ = "MidiInWinMM::closePort: error closing Windows MM MIDI input port (MMRESULT " +
+                     std::to_string( result ) + ").";
+      error( RtMidiError::WARNING, errorString_ );
+    }
   }
 }
 
@@ -3165,9 +3217,29 @@ void MidiOutWinMM :: closePort( void )
     // Controllers" (to all 16 channels) CC messages which is undesirable (see issue #222)
     // midiOutReset( data->outHandle );
 
-    midiOutClose( data->outHandle );
+    // midiOutClose() returns MIDIERR_STILLPLAYING while buffers are still
+    // queued, and in that case the handle is NOT closed. The midiOutReset()
+    // that would retire them is deliberately disabled above, so give the
+    // driver a bounded time to finish rather than dropping the handle.
+    const DWORD start = GetTickCount();
+    MMRESULT result;
+    for ( ;; ) {
+      result = midiOutClose( data->outHandle );
+      if ( result != MIDIERR_STILLPLAYING || GetTickCount() - start >= kWinMMBufferReleaseTimeoutMs ) break;
+      Sleep( 1 );
+    }
     data->outHandle = 0;
+    data->sysexInProgress = false;
     connected_ = false;
+
+    // Reported once the object is back in a consistent state, and as a
+    // warning rather than an error: closePort() also runs from the
+    // destructor, where a thrown RtMidiError would terminate the process.
+    if ( result != MMSYSERR_NOERROR ) {
+      errorString_ = "MidiOutWinMM::closePort: error closing Windows MM MIDI output port (MMRESULT " +
+                     std::to_string( result ) + "); the handle may have leaked.";
+      error( RtMidiError::WARNING, errorString_ );
+    }
   }
 }
 
@@ -3207,11 +3279,46 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 
   MMRESULT result;
   WinMidiData *data = static_cast<WinMidiData *> (apiData_);
-  if ( nBytes > 3 ) { // Sysex message
 
-    // Allocate buffer for sysex data.
+  // Decide whether this buffer belongs on the long-message (SysEx) path.
+  //
+  // Routing on length alone is wrong: a caller may hand a large SysEx to
+  // sendMessage() in several spans so it can pace the transfer, and the final
+  // span is frequently short - often a bare 0xF7. Under a size-only test that
+  // tail took the midiOutShortMsg() branch, which must not be used for SysEx,
+  // so the remaining bytes never reached the device and the transfer never
+  // completed. Track the SysEx state instead, so a continuation is routed by
+  // what it is rather than by how big it happens to be.
+  bool isSysex = data->sysexInProgress || message[0] == 0xF0;
+  if ( !isSysex && nBytes > 3 ) isSysex = true;
+
+  if ( isSysex ) {
+
+    // Work out the framing state this buffer leaves behind, but commit it only
+    // once midiOutLongMsg() has accepted the bytes (below). If the send fails,
+    // the state stays as it was, so a caller that retries the same span gets
+    // it routed the same way; otherwise a retried tail of 1-3 bytes would drop
+    // to midiOutShortMsg() and be lost again. Real-time bytes (0xF8-0xFF) may
+    // be interleaved mid-SysEx without ending it; 0xF7 ends it, and so does
+    // any other non-real-time status byte.
+    bool nextSysexInProgress = data->sysexInProgress;
+    for ( unsigned int i=0; i<nBytes; ++i ) {
+      const unsigned char b = message[i];
+      if ( b >= 0xF8 ) continue;
+      if ( b == 0xF0 ) { nextSysexInProgress = true; continue; }
+      if ( b == 0xF7 ) { nextSysexInProgress = false; continue; }
+      if ( b >= 0x80 ) nextSysexInProgress = false;
+    }
+
+    // Allocate the MIDIHDR and its buffer on the heap. Once
+    // midiOutPrepareHeader() succeeds the driver holds pointers to both, so
+    // the failure exits below that may leave the driver owning them leak both
+    // on purpose. Leaking only the buffer is not enough: a stack MIDIHDR would
+    // be reused as soon as this function returned (#377).
+    MIDIHDR *sysex = new MIDIHDR();
     char *buffer = (char *) malloc( nBytes );
     if ( buffer == NULL ) {
+      delete sysex;
       errorString_ = "MidiOutWinMM::sendMessage: error allocating sysex message memory!";
       error( RtMidiError::MEMORY_ERROR, errorString_ );
       return;
@@ -3220,36 +3327,79 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     // Copy data to buffer.
     for ( unsigned int i=0; i<nBytes; ++i ) buffer[i] = message[i];
 
-    // Create and prepare MIDIHDR structure.
-    MIDIHDR sysex{};
-    sysex.lpData = (LPSTR) buffer;
-    sysex.dwBufferLength = nBytes;
-    sysex.dwFlags = 0;
-    result = midiOutPrepareHeader( data->outHandle,  &sysex, sizeof( MIDIHDR ) );
+    sysex->lpData = (LPSTR) buffer;
+    sysex->dwBufferLength = nBytes;
+    sysex->dwFlags = 0;
+    result = midiOutPrepareHeader( data->outHandle, sysex, sizeof( MIDIHDR ) );
     if ( result != MMSYSERR_NOERROR ) {
+      // Nothing was handed to the driver, so both can be freed.
       free( buffer );
-      errorString_ = "MidiOutWinMM::sendMessage: error preparing sysex header.";
+      delete sysex;
+      errorString_ = "MidiOutWinMM::sendMessage: error preparing sysex header (MMRESULT " +
+                     std::to_string( result ) + ").";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
       return;
     }
 
-    // Send the message.
-    result = midiOutLongMsg( data->outHandle, &sysex, sizeof( MIDIHDR ) );
+    // Send the message. From here on, free only what the driver has provably
+    // released, i.e. only after midiOutUnprepareHeader() succeeds.
+    result = midiOutLongMsg( data->outHandle, sysex, sizeof( MIDIHDR ) );
     if ( result != MMSYSERR_NOERROR ) {
-      free( buffer );
-      errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message.";
+      if ( midiOutUnprepareHeader( data->outHandle, sysex, sizeof( MIDIHDR ) ) == MMSYSERR_NOERROR ) {
+        free( buffer );
+        delete sysex;
+      } // else deliberately leaked: the driver may still hold them
+      errorString_ = "MidiOutWinMM::sendMessage: error sending sysex message (MMRESULT " +
+                     std::to_string( result ) + ").";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
       return;
     }
+
+    // The driver has accepted the bytes, so the framing state moves on, even
+    // if releasing the buffer fails below.
+    data->sysexInProgress = nextSysexInProgress;
 
     // Unprepare the buffer and MIDIHDR.
-    while ( MIDIERR_STILLPLAYING == midiOutUnprepareHeader( data->outHandle, &sysex, sizeof ( MIDIHDR ) ) ) Sleep( 1 );
+    //
+    // midiOutUnprepareHeader() returns MIDIERR_STILLPLAYING while the driver
+    // is not yet done with the buffer, which is the one result worth retrying.
+    // Two things matter here: the retry has to be bounded, because how eagerly
+    // a driver retires a buffer is not something this library can probe for
+    // (third-party MIDI drivers are still supported on Windows); and any other
+    // non-zero result has to be treated as a failure rather than as a reason to
+    // fall out of the loop and free a buffer the driver may still own. Surprise
+    // device removal part-way through a long dump reaches exactly that path.
+    //
+    // The bound is a deadline rather than an iteration count: Sleep( 1 ) sleeps
+    // for at least one scheduler tick, ~15.6 ms by default, so counting 1 ms
+    // iterations would overshoot the intended bound many times over.
+    const DWORD start = GetTickCount();
+    for ( ;; ) {
+      result = midiOutUnprepareHeader( data->outHandle, sysex, sizeof ( MIDIHDR ) );
+      if ( result == MMSYSERR_NOERROR ) break;
+      if ( result != MIDIERR_STILLPLAYING ) {
+        errorString_ = "MidiOutWinMM::sendMessage: error unpreparing sysex header (MMRESULT " +
+                       std::to_string( result ) + "); buffer not freed.";
+        error( RtMidiError::DRIVER_ERROR, errorString_ );
+        return; // deliberately leaked: the driver may still hold them
+      }
+      if ( GetTickCount() - start >= kWinMMBufferReleaseTimeoutMs ) {
+        errorString_ = "MidiOutWinMM::sendMessage: timed out waiting for the driver to "
+                       "release the sysex buffer; buffer not freed.";
+        error( RtMidiError::DRIVER_ERROR, errorString_ );
+        return; // deliberately leaked, same reason
+      }
+      Sleep( 1 );
+    }
     free( buffer );
+    delete sysex;
   }
   else { // Channel or system message.
 
-    // Pack MIDI bytes into double word.
-    DWORD packet;
+    // Pack MIDI bytes into double word. Value-initialize: only nBytes of the
+    // four are written, and midiOutShortMsg() should not be handed
+    // indeterminate bytes even though it documents the unused ones as ignored.
+    DWORD packet = 0;
     unsigned char *ptr = (unsigned char *) &packet;
     for ( unsigned int i=0; i<nBytes; ++i ) {
       *ptr = message[i];
@@ -3259,7 +3409,8 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     // Send the message immediately.
     result = midiOutShortMsg( data->outHandle, packet );
     if ( result != MMSYSERR_NOERROR ) {
-      errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message.";
+      errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message (MMRESULT " +
+                     std::to_string( result ) + ").";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
     }
   }
