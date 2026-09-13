@@ -4395,6 +4395,7 @@ int MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -4823,6 +4824,31 @@ struct WinMidiPort
     uint8_t      group_index = 0; // UMP group (0-15); maps to traditional port number
 };
 
+// A group terminal block's name does not have to identify its device. When a
+// device's name is already taken, Windows renames the device, and the block
+// name composed from it can lose the product entirely: a second 12 Step2
+// reports blocks named "2 - Control Surface" and "2 - 12 Step2 2 - TRS MIDI
+// Out". Prefix the endpoint name unless the block name already carries it, so
+// that every port name says which device it belongs to.
+static std::string wms_port_display_name(const std::string& endpoint_name,
+                                         const std::string& block_name)
+{
+    if (block_name.empty())
+        return endpoint_name;
+    if (endpoint_name.empty())
+        return block_name;
+
+    auto lowered = [](std::string s) {
+        for (std::size_t i = 0; i < s.size(); ++i)
+            s[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+        return s;
+    };
+
+    if (lowered(block_name).find(lowered(endpoint_name)) != std::string::npos)
+        return block_name;
+    return endpoint_name + " " + block_name;
+}
+
 // Expands an endpoint's group terminal blocks into RtMidi input and output ports.
 static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
                                std::vector<WinMidiPort>& in_ports,
@@ -4879,7 +4905,7 @@ static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
             std::string gtb_name = wstring_to_utf8(
                 static_cast<std::wstring_view>(matching[0].Name()));
             WinMidiPort p;
-            p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+            p.display_name = wms_port_display_name(ep_name, gtb_name);
             p.device_id    = device_id;
             p.group_index  = matching[0].FirstGroup().Index();
             target.push_back(std::move(p));
@@ -4895,7 +4921,7 @@ static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
                 for (uint8_t g = 0; g < count; ++g)
                 {
                     WinMidiPort p;
-                    p.display_name = gtb_name.empty() ? ep_name : gtb_name;
+                    p.display_name = wms_port_display_name(ep_name, gtb_name);
                     p.device_id    = device_id;
                     p.group_index  = first + g;
                     target.push_back(std::move(p));
