@@ -4824,19 +4824,59 @@ struct WinMidiPort
     uint8_t      group_index = 0; // UMP group (0-15); maps to traditional port number
 };
 
-// A group terminal block's name does not have to identify its device. When a
-// device's name is already taken, Windows renames the device, and the block
-// name composed from it can lose the product entirely: a second 12 Step2
-// reports blocks named "2 - Control Surface" and "2 - 12 Step2 2 - TRS MIDI
-// Out". Prefix the endpoint name unless the block name already carries it, so
-// that every port name says which device it belongs to.
+// Windows gives a device whose name is already taken a "<n> - " prefix, and a
+// group terminal block name composed from such a device repeats it: a second
+// 12 Step2 reports "2 - Control Surface" and "2 - 12 Step2 2 - TRS MIDI Out".
+// Remove the prefix wherever it starts a word, leaving the device's own name.
+static std::string wms_strip_duplicate_prefixes(const std::string& name)
+{
+    std::string out;
+    out.reserve(name.size());
+
+    for (std::size_t i = 0; i < name.size(); )
+    {
+        std::size_t digits = i;
+        while (digits < name.size() && std::isdigit(static_cast<unsigned char>(name[digits])))
+            ++digits;
+
+        // "<digits> - " only, so a product name that merely starts with digits
+        // ("12 Step") is left alone.
+        if (digits > i && name.compare(digits, 3, " - ") == 0)
+        {
+            i = digits + 3;
+            continue;
+        }
+
+        const std::size_t space = name.find(' ', i);
+        if (space == std::string::npos)
+        {
+            out.append(name, i, std::string::npos);
+            break;
+        }
+        out.append(name, i, space - i + 1);
+        i = space + 1;
+    }
+
+    return out;
+}
+
+// A group terminal block's name does not have to identify its device: the one
+// composed for the 12 Step2 above loses the product entirely. Name a port
+// "<endpoint> <block>" unless the block name already carries the endpoint
+// name, so every port says which device it belongs to and the ports of one
+// device are named consistently. The 12 Step2 above becomes
+// "12 Step2 Control Surface", "12 Step2 TRS MIDI Out" and "12 Step2 CV Out",
+// matching the endpoint name Windows MIDI Services itself reports.
 static std::string wms_port_display_name(const std::string& endpoint_name,
                                          const std::string& block_name)
 {
-    if (block_name.empty())
-        return endpoint_name;
-    if (endpoint_name.empty())
-        return block_name;
+    const std::string endpoint = wms_strip_duplicate_prefixes(endpoint_name);
+    const std::string block    = wms_strip_duplicate_prefixes(block_name);
+
+    if (block.empty())
+        return endpoint;
+    if (endpoint.empty())
+        return block;
 
     auto lowered = [](std::string s) {
         for (std::size_t i = 0; i < s.size(); ++i)
@@ -4844,9 +4884,9 @@ static std::string wms_port_display_name(const std::string& endpoint_name,
         return s;
     };
 
-    if (lowered(block_name).find(lowered(endpoint_name)) != std::string::npos)
-        return block_name;
-    return endpoint_name + " " + block_name;
+    if (lowered(block).find(lowered(endpoint)) != std::string::npos)
+        return block;
+    return endpoint + " " + block;
 }
 
 // Expands an endpoint's group terminal blocks into RtMidi input and output ports.
