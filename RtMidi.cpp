@@ -4680,8 +4680,9 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 //*********************************************************************//
 //  API: Windows MIDI Services
 //
-//  Uses the Microsoft.Windows.Devices.Midi2 SDK (Windows MIDI Services).
-//  Requires the Desktop App SDK Runtime installer or Windows 11 24H2+.
+//  Uses the in-box Windows MIDI Services API, Windows.Devices.Midi2, part
+//  of Windows 11 25H2 and later. Elsewhere the backend reports itself
+//  unavailable and another API is used.
 //  https://github.com/microsoft/MIDI
 //
 //*********************************************************************//
@@ -4707,9 +4708,10 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 #include <winrt/Windows.Devices.Midi2.h>
 #include <winrt/Windows.Devices.Midi2.Enumeration.h>
 
-// The in-box Windows MIDI Services API, part of Windows 11 25H2 and later. On a
-// system without it, activating its classes fails with REGDB_E_CLASSNOTREG, the
-// backend reports itself unavailable, and RtMidi falls back to another API.
+// The in-box Windows MIDI Services API, which Microsoft is rolling out to Windows
+// 11 25H2 and later. On a system without it, activating its classes fails with
+// REGDB_E_CLASSNOTREG, the backend reports itself unavailable, and RtMidi falls
+// back to another API.
 namespace midi2     = winrt::Windows::Devices::Midi2;
 namespace midi2enum = winrt::Windows::Devices::Midi2::Enumeration;
 
@@ -6202,7 +6204,8 @@ void MidiInWinMidi2::openPort(unsigned int portNumber, const std::string& /*port
     if (!data->is_ready() && !data->init(&inputData_))
     {
         errorString_ = "MidiInWinMidi2::openPort: Windows MIDI Services is not available "
-                       "(it needs Windows 11 25H2 or later, with the MIDI service in its full mode).";
+                       "on this system (the API is missing, the MIDI service is not running, or Windows "
+                       "is set to its legacy MIDI stack).";
         error(RtMidiError::DRIVER_NOT_INSTALLED, errorString_);
         return;
     }
@@ -6372,7 +6375,8 @@ void MidiOutWinMidi2::openPort(unsigned int portNumber, const std::string& /*por
     if (!data->is_ready() && !data->init(nullptr))
     {
         errorString_ = "MidiOutWinMidi2::openPort: Windows MIDI Services is not available "
-                       "(it needs Windows 11 25H2 or later, with the MIDI service in its full mode).";
+                       "on this system (the API is missing, the MIDI service is not running, or Windows "
+                       "is set to its legacy MIDI stack).";
         error(RtMidiError::DRIVER_NOT_INSTALLED, errorString_);
         return;
     }
@@ -6472,7 +6476,7 @@ RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
         break;
     case WmsAvailability::NotPresent:
         result.available = false;
-        result.message   = "Windows MIDI Services is not part of this version of Windows (it needs Windows 11 25H2 or later).";
+        result.message   = "This version of Windows does not include the Windows MIDI Services API (Windows.Devices.Midi2).";
         break;
     case WmsAvailability::ServiceUnavailable:
         result.available = false;
