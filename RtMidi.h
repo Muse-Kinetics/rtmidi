@@ -181,11 +181,12 @@ class RTMIDI_DLL_PUBLIC RtMidi
   /*!
     Call this before constructing any RtMidiIn / RtMidiOut objects that use the
     specified API.  When available is false, message says why, and installUrl
-    holds the download URL when a runtime has to be installed (for example the
-    Windows MIDI Services Desktop App SDK Runtime).  An API that this build does
-    not include is reported as unavailable, and an API that needs no separate
-    runtime is always available.  The check is lightweight and does not open any
-    ports.
+    holds a download URL if a runtime has to be installed.  Windows MIDI Services
+    is available on Windows 11 25H2 and later when the MIDI service runs in its
+    full mode; elsewhere it is reported as unavailable, and another API can be
+    used.  An API that this build does not include is reported as unavailable,
+    and an API that needs no separate runtime is always available.  The check is
+    lightweight and does not open any ports.
   */
   static RtMidiApiAvailability checkApiAvailability( RtMidi::Api api );
 
