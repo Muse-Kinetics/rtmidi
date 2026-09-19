@@ -182,7 +182,8 @@ class RTMIDI_DLL_PUBLIC RtMidi
     Call this before constructing any RtMidiIn / RtMidiOut objects that use the
     specified API.  When available is false, message says why, and installUrl
     holds a download URL if a runtime has to be installed.  Windows MIDI Services
-    is available on Windows 11 25H2 and later when the MIDI service runs in its
+    is available where Windows includes its Windows.Devices.Midi2 API (Windows 11
+    25H2 and later, as Microsoft rolls it out) and the MIDI service runs in its
     full mode; elsewhere it is reported as unavailable, and another API can be
     used.  An API that this build does not include is reported as unavailable,
     and an API that needs no separate runtime is always available.  The check is

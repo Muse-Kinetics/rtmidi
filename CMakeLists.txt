@@ -45,7 +45,7 @@ set(RTMIDI_TARGETNAME_UNINSTALL "rt_uninstall" CACHE STRING "Name of 'uninstall'
 # API Options
 option(RTMIDI_API_JACK "Compile with JACK support." ${HAVE_JACK})
 option(RTMIDI_API_WINMM "Compile with WINMM support." ${WIN32})
-option(RTMIDI_API_WMS "Compile with Windows MIDI Services support." OFF)
+option(RTMIDI_API_WMS "Compile with Windows MIDI Services support (the in-box Windows.Devices.Midi2 API, Windows 11 25H2 and later; unavailable elsewhere at run time)." OFF)
 option(RTMIDI_API_UWP "Compile with legacy Windows.Devices.Midi (UWP) support." OFF)
 option(RTMIDI_API_CORE "Compile with CoreMIDI support." ${APPLE})
 option(RTMIDI_API_ALSA "Compile with ALSA support." ${ALSA})
@@ -165,22 +165,28 @@ if(RTMIDI_API_WMS)
   find_package(CppWinRT REQUIRED)
   find_package(WindowsMidiServices REQUIRED)
 
-  set(RTMIDI_WMS_PROJECTION_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/winrt")
-  set(RTMIDI_WMS_GENERATED_HEADER "${RTMIDI_WMS_PROJECTION_DIR}/winrt/Microsoft.Windows.Devices.Midi2.h")
+  list(APPEND INCDIRS "${CppWinRT_INCLUDE_DIR}")
 
-  add_custom_command(
-    OUTPUT "${RTMIDI_WMS_GENERATED_HEADER}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${RTMIDI_WMS_PROJECTION_DIR}"
-    COMMAND "${CppWinRT_EXECUTABLE}" -input "${WindowsMidiServices_WINMD}" -reference "${CppWinRT_WINDOWS_WINMD}" -output "${RTMIDI_WMS_PROJECTION_DIR}"
-    DEPENDS "${WindowsMidiServices_WINMD}" "${CppWinRT_WINDOWS_WINMD}"
-    COMMENT "Generating Windows MIDI Services C++/WinRT projections"
-    VERBATIM)
+  # A Windows SDK that includes the API already provides its projection;
+  # otherwise generate it from Windows.Devices.Midi2.winmd.
+  if(NOT WindowsMidiServices_SDK_PROJECTION)
+    set(RTMIDI_WMS_PROJECTION_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/winrt")
+    set(RTMIDI_WMS_GENERATED_HEADER "${RTMIDI_WMS_PROJECTION_DIR}/winrt/Windows.Devices.Midi2.h")
 
-  add_custom_target(rtmidi_generate_wms_projection DEPENDS "${RTMIDI_WMS_GENERATED_HEADER}")
+    add_custom_command(
+      OUTPUT "${RTMIDI_WMS_GENERATED_HEADER}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${RTMIDI_WMS_PROJECTION_DIR}"
+      COMMAND "${CppWinRT_EXECUTABLE}" -input "${WindowsMidiServices_WINMD}" -reference "${CppWinRT_WINDOWS_WINMD}" -output "${RTMIDI_WMS_PROJECTION_DIR}"
+      DEPENDS "${WindowsMidiServices_WINMD}" "${CppWinRT_WINDOWS_WINMD}"
+      COMMENT "Generating Windows MIDI Services C++/WinRT projections"
+      VERBATIM)
+
+    add_custom_target(rtmidi_generate_wms_projection DEPENDS "${RTMIDI_WMS_GENERATED_HEADER}")
+    list(APPEND INCDIRS "${RTMIDI_WMS_PROJECTION_DIR}")
+  endif()
 
   list(APPEND API_DEFS "-D__WINDOWS_MIDI_SERVICES__")
   list(APPEND API_LIST "wms")
-  list(APPEND INCDIRS "${CppWinRT_INCLUDE_DIR}" "${RTMIDI_WMS_PROJECTION_DIR}")
   list(APPEND LINKLIBS windowsapp runtimeobject ole32)
 
   # Optional: use the zero-allocation COM raw send path instead of WinRT
@@ -194,13 +200,13 @@ endif()
 
 # Windows.Devices.Midi (legacy UWP MIDI API)
 #
-# Unlike WMS, this is a built-in OS namespace, not a separate SDK component -
-# modern Windows 10 SDKs (10.0.17763+) ship its C++/WinRT projection headers
-# pre-built under <SDK>/Include/<version>/cppwinrt/winrt/Windows.Devices.Midi.h,
-# so no cppwinrt.exe projection-generation step is needed the way WMS's
-# third-party Microsoft.Windows.Devices.Midi2.winmd requires. Just the same
-# base WinRT-from-a-classic-desktop-app plumbing (find the SDK's cppwinrt
-# include dir, link the base WinRT activation libs).
+# Modern Windows 10 SDKs (10.0.17763+) ship this namespace's C++/WinRT
+# projection headers pre-built under
+# <SDK>/Include/<version>/cppwinrt/winrt/Windows.Devices.Midi.h, so unlike WMS
+# (until a Windows SDK includes Windows.Devices.Midi2) no cppwinrt.exe
+# projection-generation step is needed. Just the same base
+# WinRT-from-a-classic-desktop-app plumbing (find the SDK's cppwinrt include
+# dir, link the base WinRT activation libs).
 if(RTMIDI_API_UWP)
   if(NOT WIN32)
     message(FATAL_ERROR "RTMIDI_API_UWP is only supported on Windows")
