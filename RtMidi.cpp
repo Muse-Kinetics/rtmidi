@@ -3601,8 +3601,11 @@ int MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
       errorString_ = "MidiOutWinMM::sendMessage: error sending MIDI message (MMRESULT " +
                      std::to_string( result ) + ").";
       error( RtMidiError::DRIVER_ERROR, errorString_ );
+      return -1;
     }
   }
+
+  return static_cast<int>( nBytes );
 }
 
 #endif  // __WINDOWS_MM__
@@ -5877,6 +5880,7 @@ int MidiOutWinMidi2::sendMessage(const unsigned char* message, size_t size)
     // chunked transfer no real backpressure signal - only whatever gap the
     // caller adds itself. Whether that matters in practice depends on the WMS
     // transport's own internal pacing, which has not been characterized here.
+    return static_cast<int>( size );
 }
 
 // ---------------------------------------------------------------------------
