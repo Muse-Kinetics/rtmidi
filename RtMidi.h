@@ -166,7 +166,7 @@ class RTMIDI_DLL_PUBLIC RtMidi
     WEB_MIDI_API,   /*!< W3C Web MIDI API. */
     WINDOWS_UWP,    /*!< The Microsoft Universal Windows Platform MIDI API. */
     ANDROID_AMIDI,  /*!< Native Android MIDI API. */
-    WINDOWS_MIDI_SERVICES, /*!< Windows MIDI Services (Windows 11 24H2+). */
+    WINDOWS_MIDI_SERVICES, /*!< Windows MIDI Services (Windows 11 25H2+). */
     NUM_APIS        /*!< Number of values in this enum. */
   };
 

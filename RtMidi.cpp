@@ -6239,9 +6239,11 @@ void MidiInWinMidi2::openPort(unsigned int portNumber, const std::string& /*port
     connected_ = true;
 }
 
+// Virtual ports are not implemented yet, waiting on https://www.github.com/microsoft/MIDI/issues/1047
+// to make it's way into the in box version of Windows MIDI Services
 void MidiInWinMidi2::openVirtualPort(const std::string& /*portName*/)
 {
-    errorString_ = "MidiInWinMidi2::openVirtualPort: not supported by Windows MIDI Services.";
+    errorString_ = "MidiInWinMidi2::openVirtualPort: not implemented yet for Windows MIDI Services.";
     error(RtMidiError::WARNING, errorString_);
 }
 
@@ -6419,9 +6421,10 @@ void MidiOutWinMidi2::closePort()
     }
 }
 
+// Not implemented yet; still a stub.
 void MidiOutWinMidi2::openVirtualPort(const std::string& /*portName*/)
 {
-    errorString_ = "MidiOutWinMidi2::openVirtualPort: not supported by Windows MIDI Services.";
+    errorString_ = "MidiOutWinMidi2::openVirtualPort: not implemented yet for Windows MIDI Services.";
     error(RtMidiError::WARNING, errorString_);
 }
 
