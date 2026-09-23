@@ -1676,6 +1676,7 @@ void MidiOutCore :: openVirtualPort( const std::string &portName )
 
 void MidiOutCore :: sendMessage( const unsigned char *message, size_t size )
 {
+  std::lock_guard<std::mutex> lock( sendMutex_ );
   // We use the MIDISendSysex() function to asynchronously send sysex
   // messages.  Otherwise, we use a single CoreMidi MIDIPacket.
   unsigned int nBytes = static_cast<unsigned int> (size);
@@ -3040,6 +3041,7 @@ void MidiOutAlsa :: openVirtualPort( const std::string &portName )
 
 void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
 {
+  std::lock_guard<std::mutex> lock( sendMutex_ );
   long result;
   AlsaMidiData *data = static_cast<AlsaMidiData *> (apiData_);
   unsigned int nBytes = static_cast<unsigned int> (size);
@@ -3711,6 +3713,14 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 {
   if ( !connected_ ) return;
 
+  // Held while the SysEx framing state is read and committed, and released
+  // before the wait for the driver to give the buffer back: that wait is
+  // bounded by kWinMMBufferReleaseTimeoutMs and holding a lock across it would
+  // stall an unrelated thread's short message for as long as a large dump
+  // takes.  The state this guards is data->sysexInProgress, read below and
+  // committed once midiOutLongMsg() has accepted the bytes.
+  std::unique_lock<std::mutex> lock( sendMutex_ );
+
   unsigned int nBytes = static_cast<unsigned int>(size);
   if ( nBytes == 0 ) {
     errorString_ = "MidiOutWinMM::sendMessage: message argument is empty!";
@@ -3799,6 +3809,10 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
     // The driver has accepted the bytes, so the framing state moves on, even
     // if releasing the buffer fails below.
     data->sysexInProgress = nextSysexInProgress;
+
+    // The framing state is committed; everything below only touches this
+    // call's own MIDIHDR and buffer, so another thread may start its message.
+    lock.unlock();
 
     // Unprepare the buffer and MIDIHDR.
     //
@@ -5147,6 +5161,7 @@ void MidiOutJack :: setPortName( const std::string &portName )
 
 void MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
 {
+  std::lock_guard<std::mutex> lock( sendMutex_ );
   int nBytes = static_cast<int>(size);
   JackMidiData *data = static_cast<JackMidiData *> (apiData_);
 
@@ -5926,6 +5941,7 @@ void MidiOutAndroid :: setPortName( const std::string &portName ) {
 }
 
 void MidiOutAndroid :: sendMessage( const unsigned char *message, size_t size ) {
+  std::lock_guard<std::mutex> lock( sendMutex_ );
   AMidiInputPort_send(midiInputPort, (uint8_t*)message, size);
 }
 

@@ -80,6 +80,7 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <mutex>
 #include <vector>
 
 namespace rt {
@@ -533,6 +534,13 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       synchronously: this call does not return until the driver has finished
       with the data, which for a large dump over a slow link can take a
       noticeable amount of time. Avoid calling it from a user-interface thread.
+
+      Individual calls are serialized, so two threads calling this on the same
+      object cannot corrupt each other's messages. That is the whole of the
+      guarantee: it says nothing about the order in which messages from
+      different threads arrive, and a SysEx split across several calls still
+      needs the caller to keep other threads off the port for the whole
+      sequence, since the backend tracks the framing state between calls.
   */
   void sendMessage( const std::vector<unsigned char> *message );
 
@@ -545,6 +553,13 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       synchronously: this call does not return until the driver has finished
       with the data, which for a large dump over a slow link can take a
       noticeable amount of time. Avoid calling it from a user-interface thread.
+
+      Individual calls are serialized, so two threads calling this on the same
+      object cannot corrupt each other's messages. That is the whole of the
+      guarantee: it says nothing about the order in which messages from
+      different threads arrive, and a SysEx split across several calls still
+      needs the caller to keep other threads off the port for the whole
+      sequence, since the backend tracks the framing state between calls.
 
       \param message A pointer to the MIDI message as raw bytes
       \param size    Length of the MIDI message in bytes
@@ -687,6 +702,15 @@ class RTMIDI_DLL_PUBLIC MidiOutApi : public MidiApi
   MidiOutApi( void );
   virtual ~MidiOutApi( void );
   virtual void sendMessage( const unsigned char *message, size_t size ) = 0;
+
+ protected:
+  // Serializes sendMessage() on one object.  Each backend keeps per-object
+  // send state -- a shared encode buffer, a SysEx framing flag, a ring buffer
+  // -- and concurrent calls would otherwise interleave or corrupt a message.
+  // Held only while that state is being touched, never across a blocking
+  // driver call: see MidiOutWinMM::sendMessage(), where a SysEx send waits for
+  // the driver to release the buffer.
+  std::mutex sendMutex_;
 };
 
 // **************************************************************** //
