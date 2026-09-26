@@ -5314,7 +5314,8 @@ public:
 
     ~WinMidiEndpointCache();
 
-    std::vector<WinMidiPort> ports(bool for_input) const;
+    std::vector<WinMidiPort> ports(bool for_input);
+    void recheck_provisional();
 
 private:
     struct Endpoint
@@ -5322,6 +5323,19 @@ private:
         std::wstring             device_id;
         std::vector<WinMidiPort> in_ports;
         std::vector<WinMidiPort> out_ports;
+
+        // True when the ports came from the endpoint's own blocks because the
+        // service had published no MIDI 1.0 ports for some group. A device that
+        // has just been plugged in is announced before its ports are published,
+        // so this is re-checked rather than left as the endpoint's final shape.
+        bool provisional = false;
+
+        // When this endpoint first went provisional and stayed that way, and
+        // whether it turned up after the library was already running. Together
+        // they keep the warning quiet while a device that has just been plugged
+        // in settles, which normally takes about a second.
+        std::chrono::steady_clock::time_point provisional_since{};
+        bool appeared_while_running = false;
     };
 
     // Data written by the watcher callbacks. Each callback holds its own
@@ -5468,14 +5482,59 @@ void WinMidiEndpointCache::revoke_handlers()
     tok_added_ = tok_updated_ = tok_removed_ = tok_enumerated_ = {};
 }
 
-std::vector<WinMidiPort> WinMidiEndpointCache::ports(bool for_input) const
+// Re-reads any endpoint whose ports came from its blocks. A device is announced
+// as soon as Windows knows of it, which can be before the service has published
+// its MIDI 1.0 ports, and no further notification follows once they appear: an
+// endpoint parsed in that moment would otherwise keep its fallback port names
+// for the life of the process, so a device that was unplugged and plugged in
+// again would come back under different names than every other application
+// shows. Only endpoints still marked provisional are re-read, so this costs
+// nothing once they settle.
+void WinMidiEndpointCache::recheck_provisional()
 {
+    std::vector<std::wstring> pending;
+    {
+        std::lock_guard<std::mutex> lock(state_->mtx);
+        for (Endpoint const& ep : state_->endpoints)
+            if (ep.provisional) pending.push_back(ep.device_id);
+    }
+
+    for (std::wstring const& id : pending)
+    {
+        try
+        {
+            auto info = MidiEndpointDeviceInformation::CreateFromEndpointDeviceId(winrt::hstring(id));
+            if (info)
+                state_->set_endpoint(info, false);
+        }
+        catch (winrt::hresult_error const&)
+        {
+        }
+    }
+}
+
+std::vector<WinMidiPort> WinMidiEndpointCache::ports(bool for_input)
+{
+    recheck_provisional();
+
+    // A device that has just appeared is briefly missing its published ports,
+    // which is not worth telling anyone about: hold the warning back until the
+    // endpoint has stayed that way longer than settling takes.
+    const auto quiet_for = std::chrono::seconds(5);
+    const auto now       = std::chrono::steady_clock::now();
+
     std::vector<WinMidiPort> result;
     std::lock_guard<std::mutex> lock(state_->mtx);
     for (auto const& ep : state_->endpoints)
     {
         auto const& list = for_input ? ep.in_ports : ep.out_ports;
-        result.insert(result.end(), list.begin(), list.end());
+        const bool settling = ep.provisional && ep.appeared_while_running &&
+                              ( now - ep.provisional_since ) < quiet_for;
+        for (WinMidiPort const& p : list)
+        {
+            result.push_back(p);
+            if (settling) result.back().warning.clear();
+        }
     }
     return result;
 }
@@ -5485,13 +5544,29 @@ void WinMidiEndpointCache::State::set_endpoint(
 {
     Endpoint ep;
     ep.device_id = static_cast<std::wstring>(info.EndpointDeviceId());
-    wms_parse_endpoint(info, ep.in_ports, ep.out_ports);
+    wms_parse_endpoint(info, ep.in_ports, ep.out_ports, &ep.provisional);
 
     std::lock_guard<std::mutex> lock(mtx);
+
+    // Only an endpoint that turns up after the first enumeration is settling.
+    // One that was already there when the library started has had all the time
+    // it needs, so a short port list on it is worth saying out loud at once.
+    ep.provisional_since       = std::chrono::steady_clock::now();
+    ep.appeared_while_running  = enumerated;
+
     auto it = std::find_if(endpoints.begin(), endpoints.end(),
         [&ep](Endpoint const& e) { return e.device_id == ep.device_id; });
     if (it != endpoints.end())
+    {
+        // Keep the original moment, so an endpoint that has been provisional
+        // for a while does not look new after every re-check.
+        if (it->provisional && ep.provisional)
+        {
+            ep.provisional_since      = it->provisional_since;
+            ep.appeared_while_running = it->appeared_while_running;
+        }
         *it = std::move(ep);
+    }
     else if (add_if_missing)
         endpoints.push_back(std::move(ep));
 }
