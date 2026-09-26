@@ -4707,13 +4707,15 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Midi2.h>
 #include <winrt/Windows.Devices.Midi2.Enumeration.h>
+#include <winrt/Windows.Devices.Midi2.Enumeration.Legacy.h>
 
 // The in-box Windows MIDI Services API, which Microsoft is rolling out to Windows
 // 11 25H2 and later. On a system without it, activating its classes fails with
 // REGDB_E_CLASSNOTREG, the backend reports itself unavailable, and RtMidi falls
 // back to another API.
-namespace midi2     = winrt::Windows::Devices::Midi2;
-namespace midi2enum = winrt::Windows::Devices::Midi2::Enumeration;
+namespace midi2      = winrt::Windows::Devices::Midi2;
+namespace midi2enum  = winrt::Windows::Devices::Midi2::Enumeration;
+namespace midi2legacy = winrt::Windows::Devices::Midi2::Enumeration::Legacy;
 
 // ---------------------------------------------------------------------------
 // COM extension interface - inline definition from the IDL.
@@ -4744,6 +4746,8 @@ using midi2enum::MidiEndpointDeviceWatcher;
 using midi2enum::MidiEndpointDeviceInformationAddedEventArgs;
 using midi2enum::MidiEndpointDeviceInformationUpdatedEventArgs;
 using midi2enum::MidiEndpointDeviceInformationRemovedEventArgs;
+using midi2enum::Midi1PortFlow;
+using midi2legacy::MidiLegacyPortDeviceInformation;
 
 // ---------------------------------------------------------------------------
 // Process-wide COM setup and API detection, done on first use.
@@ -5062,57 +5066,15 @@ struct WinMidiPort
     std::string  display_name;    // UTF-8 for RtMidi consumers
     std::wstring device_id;       // EndpointDeviceId for SDK calls
     uint8_t      group_index = 0; // UMP group (0-15); maps to traditional port number
+    std::string  warning;         // reported once per object, empty in the normal case
 };
 
-// Windows gives a device whose name is already taken a "<n> - " prefix, and a
-// group terminal block name composed from such a device repeats it: a second
-// 12 Step2 reports "2 - Control Surface" and "2 - 12 Step2 2 - TRS MIDI Out".
-// Remove the prefix wherever it starts a word, leaving the device's own name.
-static std::string wms_strip_duplicate_prefixes(const std::string& name)
+// Used only when an endpoint publishes no MIDI 1.0 ports of its own; see
+// wms_legacy_ports(). Windows composes a port name as "<endpoint> <port>"
+// unless the port name already carries the endpoint name, and this follows it.
+static std::string wms_port_display_name(const std::string& endpoint,
+                                         const std::string& block)
 {
-    std::string out;
-    out.reserve(name.size());
-
-    for (std::size_t i = 0; i < name.size(); )
-    {
-        std::size_t digits = i;
-        while (digits < name.size() && std::isdigit(static_cast<unsigned char>(name[digits])))
-            ++digits;
-
-        // "<digits> - " only, so a product name that merely starts with digits
-        // ("12 Step") is left alone.
-        if (digits > i && name.compare(digits, 3, " - ") == 0)
-        {
-            i = digits + 3;
-            continue;
-        }
-
-        const std::size_t space = name.find(' ', i);
-        if (space == std::string::npos)
-        {
-            out.append(name, i, std::string::npos);
-            break;
-        }
-        out.append(name, i, space - i + 1);
-        i = space + 1;
-    }
-
-    return out;
-}
-
-// A group terminal block's name does not have to identify its device: the one
-// composed for the 12 Step2 above loses the product entirely. Name a port
-// "<endpoint> <block>" unless the block name already carries the endpoint
-// name, so every port says which device it belongs to and the ports of one
-// device are named consistently. The 12 Step2 above becomes
-// "12 Step2 Control Surface", "12 Step2 TRS MIDI Out" and "12 Step2 CV Out",
-// matching the endpoint name Windows MIDI Services itself reports.
-static std::string wms_port_display_name(const std::string& endpoint_name,
-                                         const std::string& block_name)
-{
-    const std::string endpoint = wms_strip_duplicate_prefixes(endpoint_name);
-    const std::string block    = wms_strip_duplicate_prefixes(block_name);
-
     if (block.empty())
         return endpoint;
     if (endpoint.empty())
@@ -5129,19 +5091,82 @@ static std::string wms_port_display_name(const std::string& endpoint_name,
     return endpoint + " " + block;
 }
 
-// Expands an endpoint's group terminal blocks into RtMidi input and output ports.
+// Takes the endpoint's MIDI 1.0 ports as the service publishes them, in its own
+// port order, and returns how many were found.
+//
+// These are the names the user already sees: the same strings WinMM reports and
+// MIDI Settings shows, with the endpoint and port names combined, duplicates
+// disambiguated, and any name the user assigned honoured. Windows composes them
+// from the device's blocks by a documented algorithm that has more to it than a
+// library should reimplement - naming style is a per-system and per-endpoint
+// setting, and custom names are published verbatim. Asking for the result keeps
+// RtMidi's port names identical to every other MIDI 1.0 view of the machine.
+// https://microsoft.github.io/MIDI/kb/how-midi1-port-names-are-generated/
+static std::size_t wms_legacy_ports(std::wstring const& device_id,
+                                    Midi1PortFlow flow,
+                                    std::vector<WinMidiPort>& target)
+{
+    std::vector<std::pair<uint32_t, WinMidiPort>> found;   // keyed by port number
+
+    try
+    {
+        auto ports = MidiLegacyPortDeviceInformation::FindAllForAssociatedEndpoint(
+            winrt::hstring(device_id), flow);
+        for (auto const& port : ports)
+        {
+            WinMidiPort p;
+            p.display_name = wstring_to_utf8(static_cast<std::wstring_view>(port.Name()));
+            p.device_id    = device_id;
+            p.group_index  = port.Group().Index();
+            found.emplace_back(port.Number(), std::move(p));
+        }
+    }
+    catch (winrt::hresult_error const&)
+    {
+        return 0;   // no MIDI 1.0 view of this endpoint; the caller falls back
+    }
+
+    std::sort(found.begin(), found.end(),
+        [](std::pair<uint32_t, WinMidiPort> const& a, std::pair<uint32_t, WinMidiPort> const& b) {
+            return a.first < b.first;
+        });
+
+    for (auto& entry : found)
+        target.push_back(std::move(entry.second));
+
+    return found.size();
+}
+
+// Turns one endpoint into RtMidi input and output ports, preferring the MIDI 1.0
+// ports the service publishes and falling back to its group terminal blocks for
+// an endpoint that has none - a MIDI 2.0 endpoint with no MIDI 1.0 representation.
 static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
                                std::vector<WinMidiPort>& in_ports,
-                               std::vector<WinMidiPort>& out_ports)
+                               std::vector<WinMidiPort>& out_ports,
+                               bool* used_blocks = nullptr)
 {
+    if (used_blocks) *used_blocks = false;
     std::string  ep_name   = wstring_to_utf8(static_cast<std::wstring_view>(ep.Name()));
     std::wstring device_id = static_cast<std::wstring>(ep.EndpointDeviceId());
+
+    // A source sends to the host, which is an RtMidi input.
+    std::vector<WinMidiPort> published_in, published_out;
+    wms_legacy_ports(device_id, Midi1PortFlow::MidiMessageSource, published_in);
+    wms_legacy_ports(device_id, Midi1PortFlow::MidiMessageDestination, published_out);
 
     auto gtbs = ep.GetGroupTerminalBlocks();
 
     if (gtbs.Size() == 0)
     {
-        // No GTBs - single port at group 0, usable for both IN and OUT.
+        // Nothing to describe the endpoint's shape, so the published list is all
+        // there is; failing that, a single port at group 0 for both directions.
+        if (!published_in.empty() || !published_out.empty())
+        {
+            in_ports  = std::move(published_in);
+            out_ports = std::move(published_out);
+            return;
+        }
+        if (used_blocks) *used_blocks = true;
         WinMidiPort p;
         p.display_name = ep_name;
         p.device_id    = device_id;
@@ -5210,8 +5235,61 @@ static void wms_parse_endpoint(MidiEndpointDeviceInformation const& ep,
         }
     };
 
-    expand(in_gtbs, in_ports);
-    expand(out_gtbs, out_ports);
+    std::vector<WinMidiPort> block_in, block_out;
+    expand(in_gtbs, block_in);
+    expand(out_gtbs, block_out);
+
+    // The published list is preferred, but it only covers the groups the service
+    // knows about. If it covers fewer than the endpoint itself describes, some of
+    // the device is unreachable, so use the endpoint's own blocks and tell the
+    // application why its port names may differ from other MIDI 1.0 software.
+    // Compared by the groups they reach, not by how many entries they have: one
+    // group may be described by more than one block, which is not a shortfall.
+    auto groups_of = [](std::vector<WinMidiPort> const& ports)
+    {
+        std::vector<uint8_t> groups;
+        for (WinMidiPort const& p : ports) groups.push_back(p.group_index);
+        std::sort(groups.begin(), groups.end());
+        groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+        return groups;
+    };
+
+    auto choose = [&](std::vector<WinMidiPort>& published,
+                      std::vector<WinMidiPort>& blocks,
+                      std::vector<WinMidiPort>& target,
+                      const char* direction)
+    {
+        const std::vector<uint8_t> pub_groups = groups_of(published);
+        const std::vector<uint8_t> blk_groups = groups_of(blocks);
+
+        std::vector<uint8_t> missing;
+        std::set_difference(blk_groups.begin(), blk_groups.end(),
+                            pub_groups.begin(), pub_groups.end(),
+                            std::back_inserter(missing));
+
+        if (!published.empty() && missing.empty())
+        {
+            target = std::move(published);
+            return;
+        }
+
+        if (used_blocks) *used_blocks = true;
+
+        if (!published.empty())
+        {
+            std::string note = "Windows MIDI Services lists no MIDI 1.0 " + std::string(direction) +
+                " port for group" + (missing.size() > 1 ? "s " : " ");
+            for (std::size_t i = 0; i < missing.size(); ++i)
+                note += (i ? ", " : "") + std::to_string(missing[i]);
+            note += " of \"" + ep_name + "\", which the endpoint describes. Using the endpoint's own "
+                "blocks, so these port names may differ from the ones other MIDI 1.0 applications show.";
+            for (WinMidiPort& p : blocks) p.warning = note;
+        }
+        target = std::move(blocks);
+    };
+
+    choose(published_in,  block_in,  in_ports,  "input");
+    choose(published_out, block_out, out_ports, "output");
 }
 
 class WinMidiServicesClass;
@@ -5449,6 +5527,21 @@ public:
     size_t get_num_ports() const { return ports_.size(); }
     std::string get_port_name(size_t n) const { return ports_[n].display_name; }
 
+    // Anything the port list needs to tell the application, each message once
+    // per object so a repeated getPortCount() does not repeat it.
+    std::vector<std::string> take_new_warnings()
+    {
+        std::vector<std::string> fresh;
+        for (WinMidiPort const& p : ports_)
+        {
+            if (p.warning.empty()) continue;
+            if (std::find(warned_.begin(), warned_.end(), p.warning) != warned_.end()) continue;
+            warned_.push_back(p.warning);
+            fresh.push_back(p.warning);
+        }
+        return fresh;
+    }
+
     bool open(size_t port_number);
     void close();
 
@@ -5471,6 +5564,7 @@ private:
 
     std::shared_ptr<WinMidiEndpointCache> cache_;
     std::vector<WinMidiPort> ports_;
+    std::vector<std::string> warned_;
 
     // Set while a port is open: the endpoint's shared connection, and for an
     // input port, its registration as a receiver on that connection.
@@ -6278,6 +6372,11 @@ unsigned int MidiInWinMidi2::getPortCount()
     // live-query behaviour of the WinMM backend.
     if (!connected_)
         data->refresh_ports();
+    for (std::string const& note : data->take_new_warnings())
+    {
+        errorString_ = "MidiInWinMidi2::getPortCount: " + note;
+        error(RtMidiError::WARNING, errorString_);
+    }
     return static_cast<unsigned int>(data->get_num_ports());
 }
 
@@ -6345,6 +6444,11 @@ unsigned int MidiOutWinMidi2::getPortCount()
     // Re-read the watcher cache on every call when no port is open - matches WinMM behaviour.
     if (!connected_)
         data->refresh_ports();
+    for (std::string const& note : data->take_new_warnings())
+    {
+        errorString_ = "MidiOutWinMidi2::getPortCount: " + note;
+        error(RtMidiError::WARNING, errorString_);
+    }
     return static_cast<unsigned int>(data->get_num_ports());
 }
 
