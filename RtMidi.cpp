@@ -5405,9 +5405,15 @@ bool WinMidiEndpointCache::start()
             [state](MidiEndpointDeviceWatcher const&,
                     MidiEndpointDeviceInformationUpdatedEventArgs const& args)
             {
+                // Added when missing, not only updated: a device that is
+                // unplugged and plugged in again is already known to Windows, so
+                // its return arrives as an update. Ignoring those left the
+                // endpoint out of the list for the life of the process. The
+                // watcher's filters decide what reaches here, so anything that
+                // does belongs in the list.
                 auto info = args.UpdatedDevice();
                 if (info)
-                    state->set_endpoint(info, false);
+                    state->set_endpoint(info, true);
             });
 
         tok_removed_ = watcher_.Removed(
