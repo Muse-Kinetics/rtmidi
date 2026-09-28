@@ -4642,7 +4642,20 @@ void MidiOutWinUWP::sendMessage(const unsigned char* message, size_t size)
   #include <semaphore.h>
 #endif
 
-#define JACK_RINGBUFFER_SIZE 16384 // Default size for ringbuffer
+// Size of the per-instance output ringbuffer, in bytes.  A message is stored
+// as a 4-byte length plus its bytes and jack_ringbuffer_create() reserves one,
+// so the largest SysEx that fits is this minus 5.  Define
+// JACK_RINGBUFFER_SIZE_OVERRIDE to raise it.  32768 is the largest useful
+// value: JACK itself refuses any event over 32720 bytes (its port buffer is
+// BUFFER_SIZE_MAX * sizeof(jack_default_audio_sample_t) whatever the period
+// size, less a header and one event descriptor), and asking for more only
+// wastes memory, since jack_ringbuffer_create() rounds up to a power of two.
+
+#if defined(JACK_RINGBUFFER_SIZE_OVERRIDE)
+  #define JACK_RINGBUFFER_SIZE JACK_RINGBUFFER_SIZE_OVERRIDE
+#else
+  #define JACK_RINGBUFFER_SIZE 16384
+#endif
 
 struct JackMidiData {
   jack_client_t *client;
@@ -5150,8 +5163,13 @@ void MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
   int nBytes = static_cast<int>(size);
   JackMidiData *data = static_cast<JackMidiData *> (apiData_);
 
-  if ( size + sizeof(nBytes) > (size_t) data->buffMaxWrite )
-      return;
+  if ( size + sizeof(nBytes) > (size_t) data->buffMaxWrite ) {
+    errorString_ = "MidiOutJack::sendMessage: message is larger than the "
+                   "output ringbuffer (" + std::to_string( data->buffMaxWrite - sizeof(nBytes) ) +
+                   " bytes); it was not sent.";
+    error( RtMidiError::WARNING, errorString_ );
+    return;
+  }
 
   while ( jack_ringbuffer_write_space(data->buff) < sizeof(nBytes) + size )
       sched_yield();
