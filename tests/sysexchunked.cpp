@@ -47,8 +47,10 @@
 //                   not been measured.  If you find a limit on one of them,
 //                   the note belongs here.
 //
-//  Receiving needs nothing special beyond ignoreTypes( false, ... ) so that
-//  SysEx is not filtered out.
+//  Receiving takes two steps: ignoreTypes( false, ... ) so SysEx is not
+//  filtered out, and setBufferSize() large enough to reassemble the message.
+//  The default input buffer is 1 kB, so a firmware-sized dump is lost without
+//  it.
 //
 //*****************************************//
 
@@ -77,6 +79,13 @@ void sendLargeSysEx( RtMidiOut &midiout, const std::vector<unsigned char> &messa
   for ( size_t offset = 0; offset < message.size(); offset += kSysExSpan ) {
     size_t count = std::min( kSysExSpan, message.size() - offset );
     midiout.sendMessage( &message[offset], count );
+
+    // Pace the pieces.  Sending a whole dump as fast as the loop can run
+    // overruns a backend that batches per processing period -- JACK collects
+    // everything sent during one period into a single port buffer of about
+    // 32 kB, and refuses the rest.  A short pause spreads the pieces across
+    // periods.  It also keeps a slow hardware link from being flooded.
+    SLEEP( 2 );
   }
 }
 
@@ -134,6 +143,13 @@ int main( int argc, char *argv[] )
     }
 
     midiin->ignoreTypes( false, true, true );   // do not ignore SysEx
+
+    // Receiving a large SysEx needs room to reassemble it.  The default input
+    // buffer is 1 kB, which is ample for ordinary MIDI and far too small for
+    // a firmware dump; the message is truncated or lost without it.  Only
+    // some backends use this, but setting it is harmless on the others.
+    midiin->setBufferSize( (unsigned int) nBytes + 1024, 4 );
+
     midiin->setCallback( &mycallback );
 
     // Give the user a moment to patch the two ports together before sending.
