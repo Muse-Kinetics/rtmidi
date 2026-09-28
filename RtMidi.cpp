@@ -3093,7 +3093,26 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
       return;
     }
   }
-  snd_seq_drain_output( data->seq );
+  // snd_seq_event_output() only queues the event; the send happens here, so
+  // this is where a failure surfaces.  A SysEx too large for the receiving
+  // client's sequencer pool is refused with -ENOMEM at this point and the
+  // message is lost.  The result was previously discarded, so that loss was
+  // silent: nothing reached the error callback and nothing was printed.
+  result = snd_seq_drain_output( data->seq );
+  if ( result < 0 ) {
+    errorString_ = "MidiOutAlsa::sendMessage: error sending MIDI message (";
+    errorString_ += snd_strerror( (int) result );
+    errorString_ += ").";
+    if ( result == -ENOMEM )
+      // The sequencer refuses a SysEx larger than the receiving client's cell
+      // pool, roughly 5.5 kB with the default pool size, and the whole message
+      // is lost.  Splitting it across several sendMessage() calls has no such
+      // limit; see tests/sysexchunked.cpp and issue #214.
+      errorString_ += "  The message may be too large for the receiver's "
+                      "sequencer pool; try sending it in smaller pieces "
+                      "(see tests/sysexchunked.cpp).";
+    error( RtMidiError::WARNING, errorString_ );
+  }
 }
 
 #endif // __LINUX_ALSA__

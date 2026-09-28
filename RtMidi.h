@@ -545,6 +545,14 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       synchronously: this call does not return until the driver has finished
       with the data, which for a large dump over a slow link can take a
       noticeable amount of time. Avoid calling it from a user-interface thread.
+
+      There is a per-message size limit on some backends, set by the transport
+      rather than by RtMidi: ALSA's sequencer refuses a single SysEx larger
+      than roughly 5.5 kB, and JACK refuses one over 32720 bytes. The message
+      is lost, and not every backend can report it. Splitting a large SysEx
+      across several calls has no such limit -- the receiver reassembles the
+      pieces -- and is the supported way to send a firmware-sized dump. See
+      tests/sysexchunked.cpp, and issue #214.
   */
   void sendMessage( const std::vector<unsigned char> *message );
 
@@ -557,6 +565,14 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       synchronously: this call does not return until the driver has finished
       with the data, which for a large dump over a slow link can take a
       noticeable amount of time. Avoid calling it from a user-interface thread.
+
+      There is a per-message size limit on some backends, set by the transport
+      rather than by RtMidi: ALSA's sequencer refuses a single SysEx larger
+      than roughly 5.5 kB, and JACK refuses one over 32720 bytes. The message
+      is lost, and not every backend can report it. Splitting a large SysEx
+      across several calls has no such limit -- the receiver reassembles the
+      pieces -- and is the supported way to send a firmware-sized dump. See
+      tests/sysexchunked.cpp, and issue #214.
 
       \param message A pointer to the MIDI message as raw bytes
       \param size    Length of the MIDI message in bytes
