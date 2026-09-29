@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <vector>
 #include "RtMidi.h"
 
@@ -92,26 +93,42 @@ void sendLargeSysEx( RtMidiOut &midiout, const std::vector<unsigned char> &messa
 void usage( void )
 {
   std::cout << "\nusage: sysexchunked N\n";
-  std::cout << "    where N = length of the SysEx message to send.\n";
-  std::cout << "    Try a size that a single sendMessage() cannot carry,\n";
-  std::cout << "    such as 66312, the size of a real firmware dump.\n\n";
+  std::cout << "       sysexchunked --listen [seconds]\n\n";
+  std::cout << "    N         length of the SysEx message to send.  Try a size a\n";
+  std::cout << "              single sendMessage() cannot carry, such as 66312,\n";
+  std::cout << "              the size of a real firmware dump.\n";
+  std::cout << "    --listen  receive only, and report what arrives.  Useful for\n";
+  std::cout << "              checking what a device actually sends, and whether\n";
+  std::cout << "              a large message survives the transport.\n\n";
   exit( 0 );
 }
 
 static std::vector<unsigned char> received;
 static bool complete = false;
+static unsigned int callbacks = 0;
 
 void mycallback( double /*deltatime*/, std::vector<unsigned char> *message, void * /*userData*/ )
 {
   received.insert( received.end(), message->begin(), message->end() );
+  callbacks++;
   if ( !received.empty() && received.back() == 0xF7 ) complete = true;
 }
 
 int main( int argc, char *argv[] )
 {
-  if ( argc != 2 ) usage();
-  size_t nBytes = (size_t) atoi( argv[1] );
-  if ( nBytes < 3 ) usage();
+  if ( argc < 2 ) usage();
+
+  bool listen = ( std::string( argv[1] ) == "--listen" );
+  size_t nBytes = 0;
+  int seconds = 30;
+
+  if ( listen ) {
+    if ( argc > 2 ) seconds = atoi( argv[2] );
+  } else {
+    if ( argc != 2 ) usage();
+    nBytes = (size_t) atoi( argv[1] );
+    if ( nBytes < 3 ) usage();
+  }
 
   RtMidiOut *midiout = 0;
   RtMidiIn *midiin = 0;
@@ -129,17 +146,24 @@ int main( int argc, char *argv[] )
         std::cout << "No MIDI ports available.\n";
         goto cleanup;
       }
-      std::cout << "Opening \"" << midiout->getPortName( 0 ) << "\" for output and\n"
-                << "        \"" << midiin->getPortName( 0 ) << "\" for input.\n"
-                << "Connect them externally for the round trip to complete.\n";
+      if ( listen )
+        std::cout << "Listening on \"" << midiin->getPortName( 0 ) << "\".\n";
+      else
+        std::cout << "Opening \"" << midiout->getPortName( 0 ) << "\" for output and\n"
+                  << "        \"" << midiin->getPortName( 0 ) << "\" for input.\n"
+                  << "Connect them externally for the round trip to complete.\n";
       midiout->openPort( 0 );
       midiin->openPort( 0 );
     }
     else {
       midiout->openVirtualPort( "sysexchunked out" );
       midiin->openVirtualPort( "sysexchunked in" );
-      std::cout << "Opened virtual ports \"sysexchunked out\" and\n"
-                << "\"sysexchunked in\". Connect them now";
+      if ( listen )
+        std::cout << "Opened virtual port \"sysexchunked in\".\n"
+                  << "Connect a device or another application to it.\n";
+      else
+        std::cout << "Opened virtual ports \"sysexchunked out\" and\n"
+                  << "\"sysexchunked in\". Connect them now";
     }
 
     midiin->ignoreTypes( false, true, true );   // do not ignore SysEx
@@ -148,15 +172,32 @@ int main( int argc, char *argv[] )
     // buffer is 1 kB, which is ample for ordinary MIDI and far too small for
     // a firmware dump; the message is truncated or lost without it.  Only
     // some backends use this, but setting it is harmless on the others.
-    midiin->setBufferSize( (unsigned int) nBytes + 1024, 4 );
+    midiin->setBufferSize( listen ? 1048576 : (unsigned int) nBytes + 1024, 4 );
 
     midiin->setCallback( &mycallback );
 
-    // Give the user a moment to patch the two ports together before sending.
-    for ( int i = 0; i < 10; i++ ) { std::cout << "." << std::flush; SLEEP( 500 ); }
-    std::cout << "\n";
+    if ( listen ) {
+      std::cout << "Listening for " << seconds << " seconds...\n";
+      for ( int i = 0; i < seconds * 10 && !complete; i++ ) SLEEP( 100 );
 
-    {
+      if ( received.empty() ) {
+        std::cout << "Nothing received.\n";
+      } else {
+        std::cout << "Received " << received.size() << " bytes in "
+                  << callbacks << " callback(s).\n";
+        // A message split by the transport arrives in several callbacks and is
+        // reassembled by RtMidi; one callback means it came through whole.
+        std::cout << "First bytes:";
+        for ( size_t i = 0; i < received.size() && i < 8; i++ )
+          std::cout << " " << std::hex << (int) received[i] << std::dec;
+        std::cout << ( complete ? "  (ends with F7)\n" : "  (no F7 seen)\n" );
+      }
+    }
+    else {
+      // Give the user a moment to patch the two ports together before sending.
+      for ( int i = 0; i < 10; i++ ) { std::cout << "." << std::flush; SLEEP( 500 ); }
+      std::cout << "\n";
+
       // F0 7D <data...> F7.  0x7D is the non-commercial manufacturer id.
       std::vector<unsigned char> message;
       message.push_back( 0xF0 );
@@ -169,7 +210,6 @@ int main( int argc, char *argv[] )
                 << kSysExSpan << "-byte pieces...\n";
       sendLargeSysEx( *midiout, message );
 
-      // Allow time for the message to arrive; a slow link needs longer.
       for ( int i = 0; i < 2000 && !complete; i++ ) SLEEP( 5 );
 
       if ( received.empty() )
