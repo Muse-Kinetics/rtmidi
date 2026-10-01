@@ -1,0 +1,38 @@
+name: iOSmk
+options:
+  bundleIdPrefix: com.musekinetics
+configs:
+  Debug: debug
+  Release: release
+targets:
+  iOSmk:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: iOSmk
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.musekinetics.iOSmk
+        SWIFT_OBJC_BRIDGING_HEADER: iOSmk/iOSmk-Bridging-Header.h
+        # Kesumo, LLC -- the company's actual Apple Developer Program team
+        # (same one already used for Developer ID / notarization elsewhere
+        # in this project). No "Apple Development" cert for this team
+        # existed on this machine yet as of 2026-10-01; Automatic signing
+        # needs a live account check to mint one (requires the signed-in
+        # account to have at least Developer role on this team).
+        DEVELOPMENT_TEAM: J372N6RANB
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) __MACOSX_CORE__=1"
+        CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+        CLANG_CXX_LIBRARY: "libc++"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "iOSmk uses Bluetooth to connect to Bluetooth MIDI devices."
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        SWIFT_VERSION: "5.0"
+    dependencies:
+      - sdk: CoreMIDI.framework
+      - sdk: CoreAudio.framework
+      - sdk: AVFoundation.framework
