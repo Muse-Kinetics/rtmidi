@@ -38,6 +38,7 @@
 /**********************************************************************/
 
 #include "RtMidi.h"
+#include <algorithm>
 #include <sstream>
 
 using namespace rt::midi;
@@ -649,6 +650,14 @@ RTMIDI_DLL_PUBLIC RtMidiIn :: RtMidiIn( RtMidi::Api api, const std::string &clie
   // one with at least one port or we reach the end of the list.
   std::vector< RtMidi::Api > apis;
   getCompiledApi( apis );
+
+  // The dummy backend reports no ports and never will, so it is only a
+  // candidate when nothing else is compiled in.  Leaving it in the list makes
+  // it the choice whenever no real API has a port yet, which leaves the object
+  // permanently deaf instead of seeing a device connected later (#398).
+  if ( apis.size() > 1 )
+    apis.erase( std::remove( apis.begin(), apis.end(), RTMIDI_DUMMY ), apis.end() );
+
   for ( unsigned int i=0; i<apis.size(); i++ ) {
     openMidiApi( apis[i], clientName, queueSizeLimit );
     if ( rtapi_ && rtapi_->getPortCount() ) break;
@@ -728,6 +737,12 @@ RTMIDI_DLL_PUBLIC RtMidiOut :: RtMidiOut( RtMidi::Api api, const std::string &cl
   // one with at least one port or we reach the end of the list.
   std::vector< RtMidi::Api > apis;
   getCompiledApi( apis );
+
+  // As above: the dummy backend is only a candidate when it is the only thing
+  // compiled in (#398).
+  if ( apis.size() > 1 )
+    apis.erase( std::remove( apis.begin(), apis.end(), RTMIDI_DUMMY ), apis.end() );
+
   for ( unsigned int i=0; i<apis.size(); i++ ) {
     openMidiApi( apis[i], clientName );
     if ( rtapi_ && rtapi_->getPortCount() ) break;
