@@ -28,11 +28,15 @@
 //                   "Midi Through" is in the path the send succeeds and the
 //                   loss happens later, with nothing observable at either end.
 //
-//  JACK             32720 bytes per message, and RtMidi's own output
-//                   ringbuffer is smaller still unless
+//  JACK             32720 bytes per message, in both directions, and RtMidi's
+//                   own output ringbuffer is smaller still unless
 //                   JACK_RINGBUFFER_SIZE_OVERRIDE is raised.  JACK's MIDI
 //                   port buffer is a fixed size regardless of the period, so
-//                   a larger period does not help.
+//                   a larger period does not help.  Receiving is the case
+//                   with no workaround: a device that sends one large SysEx
+//                   decides how it sends, and a 66 kB firmware dump measured
+//                   here never arrived, with no error reported.  Use ALSA for
+//                   large inbound SysEx on Linux.
 //
 //  CoreMIDI         No caller-visible limit: sendMessage() already breaks a
 //                   large SysEx into 64 kB MIDIPacketLists internally.
@@ -42,6 +46,10 @@
 //                   synchronous: sendMessage() does not return until the
 //                   driver has finished with the buffer.  Sending in pieces
 //                   keeps each call short, which matters on a UI thread.
+//
+//  ALSA, inbound    No limit: the kernel chunks a device's SysEx at 256 bytes
+//                   before it reaches the sequencer, so a 66 kB firmware dump
+//                   from real hardware arrives intact.  Measured.
 //
 //  Other backends   Windows MIDI Services, Web MIDI and Android AMidi have
 //                   not been measured.  If you find a limit on one of them,
