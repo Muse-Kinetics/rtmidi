@@ -590,7 +590,7 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       send pieces of at most that, each once the last has drained at the
       device's rate (3125 bytes per second for DIN MIDI).
   */
-  void sendMessage( const std::vector<unsigned char> *message );
+  int sendMessage( const std::vector<unsigned char> *message );
 
   //! Immediately send a single message out an open MIDI output port.
   /*!
@@ -611,10 +611,22 @@ class RTMIDI_DLL_PUBLIC RtMidiOut : public RtMidi
       send pieces of at most that, each once the last has drained at the
       device's rate (3125 bytes per second for DIN MIDI).
 
+      Returns the number of message bytes the backend accepted, or a negative
+      value on failure. Code that ignores the result is unaffected.
+
       \param message A pointer to the MIDI message as raw bytes
       \param size    Length of the MIDI message in bytes
   */
-  void sendMessage( const unsigned char *message, size_t size );
+  int sendMessage( const unsigned char *message, size_t size );
+
+  //! Block until output already passed to sendMessage() has actually been sent.
+  /*!
+      Useful for paced or chunked SysEx: send a chunk, drain(), then delay, so
+      the delay becomes a real gap on the wire instead of being absorbed by a
+      send queue. A no-op on backends whose sendMessage() already blocks until
+      the message is out.
+  */
+  void drain( void );
 
   //! Set an error callback function to be invoked when an error has occurred.
   /*!
@@ -788,7 +800,15 @@ class RTMIDI_DLL_PUBLIC MidiOutApi : public MidiApi
 
   MidiOutApi( void );
   virtual ~MidiOutApi( void );
-  virtual void sendMessage( const unsigned char *message, size_t size ) = 0;
+  virtual int sendMessage( const unsigned char *message, size_t size ) = 0;
+
+  //! Block until queued output for this port has actually been sent.
+  /*!
+      The default is a no-op, which is correct for backends whose sendMessage()
+      already blocks until the message is out. Backends with asynchronous output
+      override this to wait for real completion.
+  */
+  virtual void drain( void ) {}
 };
 
 // **************************************************************** //
@@ -822,8 +842,9 @@ inline void RtMidiOut :: closePort( void ) { rtapi_->closePort(); }
 inline bool RtMidiOut :: isPortOpen() const { return rtapi_->isPortOpen(); }
 inline unsigned int RtMidiOut :: getPortCount( void ) { return rtapi_->getPortCount(); }
 inline std::string RtMidiOut :: getPortName( unsigned int portNumber ) { return rtapi_->getPortName( portNumber ); }
-inline void RtMidiOut :: sendMessage( const std::vector<unsigned char> *message ) { static_cast<MidiOutApi *>(rtapi_)->sendMessage( &message->at(0), message->size() ); }
-inline void RtMidiOut :: sendMessage( const unsigned char *message, size_t size ) { static_cast<MidiOutApi *>(rtapi_)->sendMessage( message, size ); }
+inline int RtMidiOut :: sendMessage( const std::vector<unsigned char> *message ) { return static_cast<MidiOutApi *>(rtapi_)->sendMessage( &message->at(0), message->size() ); }
+inline int RtMidiOut :: sendMessage( const unsigned char *message, size_t size ) { return static_cast<MidiOutApi *>(rtapi_)->sendMessage( message, size ); }
+inline void RtMidiOut :: drain( void ) { static_cast<MidiOutApi *>(rtapi_)->drain(); }
 inline void RtMidiOut :: setErrorCallback( RtMidiErrorCallback errorCallback, void *userData ) { rtapi_->setErrorCallback(errorCallback, userData); }
 
 } // namespace midi
