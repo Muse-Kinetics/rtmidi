@@ -279,6 +279,9 @@ class MidiInWinMM: public MidiInApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
+#if defined(RTMIDI_API_WMS)
+  std::vector<std::string> getPortNames( unsigned int portNumber );
+#endif
 
  protected:
   void initialize( const std::string& clientName );
@@ -297,6 +300,9 @@ class MidiOutWinMM: public MidiOutApi
   void setPortName( const std::string &portName );
   unsigned int getPortCount( void );
   std::string getPortName( unsigned int portNumber );
+#if defined(RTMIDI_API_WMS)
+  std::vector<std::string> getPortNames( unsigned int portNumber );
+#endif
   int sendMessage( const unsigned char *message, size_t size );
 
  protected:
@@ -550,6 +556,7 @@ public:
     void setPortName( const std::string& portName ) override;
     unsigned int getPortCount( void ) override;
     std::string getPortName( unsigned int portNumber ) override;
+    std::vector<std::string> getPortNames( unsigned int portNumber ) override;
     double getMessage( std::vector<unsigned char>* message ) override;
 protected:
     void initialize( const std::string& clientName ) override;
@@ -568,6 +575,7 @@ public:
     void setPortName( const std::string& portName ) override;
     unsigned int getPortCount( void ) override;
     std::string getPortName( unsigned int portNumber ) override;
+    std::vector<std::string> getPortNames( unsigned int portNumber ) override;
     int sendMessage( const unsigned char* message, size_t size ) override;
 protected:
     void initialize( const std::string& clientName ) override;
@@ -6197,6 +6205,7 @@ public:
     void refresh_ports();
     size_t get_num_ports() const { return ports_.size(); }
     std::string get_port_name(size_t n) const { return ports_[n].display_name; }
+    WinMidiPort const& get_port(size_t n) const { return ports_[n]; }
 
     // Anything the port list needs to tell the application, each message once
     // per object so a repeated getPortCount() does not repeat it.
@@ -7269,6 +7278,131 @@ RtMidi::RtMidiApiAvailability RtMidi::checkApiAvailability( RtMidi::Api api )
     }
     return result;
 }
+
+// ---------------------------------------------------------------------------
+// getPortNames() - a port's other names, from the Windows MIDI Services name table
+//
+// The service keeps every name a MIDI 1.0 port could have in its endpoint's
+// name table. Which one is shown depends on the naming setting and on any name
+// the user gave the port; these add the rest after the one shown.
+// ---------------------------------------------------------------------------
+static void wms_append_table_names(std::wstring const& device_id, uint8_t group,
+                                   Midi1PortFlow flow, std::wstring const& shown,
+                                   std::vector<std::string>& names)
+{
+    try
+    {
+        auto ep = MidiEndpointDeviceInformation::CreateFromEndpointDeviceId(winrt::hstring(device_id));
+        if (!ep)
+            return;
+        for (auto const& row : ep.GetNameTable())
+        {
+            if (row.Group().Index() != group || row.Flow() != flow)
+                continue;
+            for (winrt::hstring const& name : { row.NewStyleName(), row.LegacyCompatibleName(), row.CustomName() })
+            {
+                if (name.empty() || static_cast<std::wstring_view>(name) == shown)
+                    continue;
+                std::string utf8 = wstring_to_utf8(static_cast<std::wstring_view>(name));
+                if (std::find(names.begin(), names.end(), utf8) == names.end())
+                    names.push_back(std::move(utf8));
+            }
+            return;
+        }
+    }
+    catch (winrt::hresult_error const&)
+    {
+    }
+}
+
+static std::vector<std::string> wms_port_names(MidiApi& api, void* api_data, unsigned int portNumber, Midi1PortFlow flow)
+{
+    std::vector<std::string> names;
+    const std::string shown = api.getPortName(portNumber);
+    if (shown.empty())
+        return names;
+    names.push_back(shown);
+
+    WinMidiServicesClass* data = static_cast<WinMidiServicesClass*>(api_data);
+    if (portNumber < data->get_num_ports())
+    {
+        WinMidiPort const& port = data->get_port(portNumber);
+        const std::wstring shown_w(winrt::to_hstring(shown));
+        wms_append_table_names(port.device_id, port.group_index, flow, shown_w, names);
+    }
+    return names;
+}
+
+std::vector<std::string> MidiInWinMidi2::getPortNames(unsigned int portNumber)
+{
+    return wms_port_names(*this, apiData_, portNumber, Midi1PortFlow::MidiMessageSource);
+}
+
+std::vector<std::string> MidiOutWinMidi2::getPortNames(unsigned int portNumber)
+{
+    return wms_port_names(*this, apiData_, portNumber, Midi1PortFlow::MidiMessageDestination);
+}
+
+#if defined(RTMIDI_API_WINMM)
+// With Windows MIDI Services running, it provides WinMM's ports and numbers them
+// as WinMM does. The name is checked as well, in case a port came or went in
+// between; WinMM cuts names to MAXPNAMELEN - 1 characters.
+static void wms_append_winmm_names(unsigned int portNumber, Midi1PortFlow flow,
+                                   std::vector<std::string>& names)
+{
+    std::wstring winmm_name;
+    if (flow == Midi1PortFlow::MidiMessageSource)
+    {
+        MIDIINCAPSW caps;
+        if (midiInGetDevCapsW(portNumber, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+            return;
+        winmm_name = caps.szPname;
+    }
+    else
+    {
+        MIDIOUTCAPSW caps;
+        if (midiOutGetDevCapsW(portNumber, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+            return;
+        winmm_name = caps.szPname;
+    }
+
+    if (!wms_runtime_available())
+        return;
+
+    try
+    {
+        for (auto const& port : MidiLegacyPortDeviceInformation::FindAll(flow))
+        {
+            if (port.Number() != portNumber)
+                continue;
+            const std::wstring name(port.Name());
+            const bool same = name == winmm_name
+                || (winmm_name.size() == MAXPNAMELEN - 1 && name.compare(0, winmm_name.size(), winmm_name) == 0);
+            if (same)
+                wms_append_table_names(std::wstring(port.AssociatedEndpointDeviceId()),
+                                       port.Group().Index(), flow, name, names);
+            return;
+        }
+    }
+    catch (winrt::hresult_error const&)
+    {
+    }
+}
+
+std::vector<std::string> MidiInWinMM :: getPortNames( unsigned int portNumber )
+{
+  std::vector<std::string> names = MidiApi::getPortNames( portNumber );
+  if ( !names.empty() ) wms_append_winmm_names( portNumber, Midi1PortFlow::MidiMessageSource, names );
+  return names;
+}
+
+std::vector<std::string> MidiOutWinMM :: getPortNames( unsigned int portNumber )
+{
+  std::vector<std::string> names = MidiApi::getPortNames( portNumber );
+  if ( !names.empty() ) wms_append_winmm_names( portNumber, Midi1PortFlow::MidiMessageDestination, names );
+  return names;
+}
+#endif  // RTMIDI_API_WINMM
 
 #endif  // RTMIDI_API_WMS
 
@@ -9480,6 +9614,14 @@ int MidiOutAndroid :: sendMessage( const unsigned char *message, size_t size ) {
 }
 
 #endif  // RTMIDI_API_AMIDI
+
+std::vector<std::string> MidiApi :: getPortNames( unsigned int portNumber )
+{
+  std::vector<std::string> names;
+  const std::string name = getPortName( portNumber );
+  if ( !name.empty() ) names.push_back( name );
+  return names;
+}
 
 // Optional backend features use non-virtual dispatch to preserve the existing
 // MidiApi and derived-class vtables. Other backends default to unsupported.
